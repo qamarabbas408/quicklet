@@ -10,11 +10,21 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
-        "title": "quicklet",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "Quicklet",
+        "width": 440,
+        "height": 440,
+        "center": false,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "visible": false
       }
     ],
     "security": {
