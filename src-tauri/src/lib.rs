@@ -14,6 +14,16 @@ const SHORTCUT_LABEL: &str = "Cmd+Shift+Space";
 #[cfg(not(target_os = "macos"))]
 const SHORTCUT_LABEL: &str = "Ctrl+Shift+Space";
 
+#[cfg(target_os = "macos")]
+tauri_nspanel::tauri_panel! {
+    panel!(QuickletPanel {
+        config: {
+            can_become_key_window: true,
+            is_floating_panel: true
+        }
+    })
+}
+
 #[derive(Default)]
 struct MenuState {
     last_shown_at: Mutex<Option<Instant>>,
@@ -44,8 +54,18 @@ fn open_menu(app: AppHandle, x: Option<f64>, y: Option<f64>) -> Result<(), Strin
 
 #[tauri::command]
 fn dismiss_menu(app: AppHandle) -> Result<(), String> {
-    let window = menu_window(&app)?;
-    window.hide().map_err(|error| error.to_string())
+    #[cfg(target_os = "macos")]
+    {
+        let panel = menu_panel(&app)?;
+        panel.hide();
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let window = menu_window(&app)?;
+        window.hide().map_err(|error| error.to_string())
+    }
 }
 
 #[tauri::command]
@@ -60,6 +80,14 @@ fn get_menu_status(app: AppHandle) -> ShortcutStatus {
 fn menu_window(app: &AppHandle) -> Result<WebviewWindow, String> {
     app.get_webview_window(MENU_WINDOW_LABEL)
         .ok_or_else(|| format!("window `{MENU_WINDOW_LABEL}` was not found"))
+}
+
+#[cfg(target_os = "macos")]
+fn menu_panel(app: &AppHandle) -> Result<tauri_nspanel::PanelHandle<tauri::Wry>, String> {
+    use tauri_nspanel::ManagerExt;
+
+    app.get_webview_panel(MENU_WINDOW_LABEL)
+        .map_err(|error| format!("panel `{MENU_WINDOW_LABEL}` was not found: {error:?}"))
 }
 
 fn show_menu(app: &AppHandle, x: Option<f64>, y: Option<f64>) -> Result<(), String> {
@@ -103,8 +131,22 @@ fn show_menu(app: &AppHandle, x: Option<f64>, y: Option<f64>) -> Result<(), Stri
     window
         .set_position(PhysicalPosition::new(position.0, position.1))
         .map_err(|error| error.to_string())?;
-    window.show().map_err(|error| error.to_string())?;
-    window.set_focus().map_err(|error| error.to_string())?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let panel = menu_panel(app)?;
+        panel.show_and_make_key();
+
+        let webview: &tauri::Webview = window.as_ref();
+        let _ = webview.set_focus();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        window.show().map_err(|error| error.to_string())?;
+        window.set_focus().map_err(|error| error.to_string())?;
+    }
+
     eprintln!(
         "quicklet: menu shown at physical ({}, {})",
         position.0, position.1
@@ -147,12 +189,25 @@ fn compute_menu_position(
 }
 
 fn toggle_menu(app: &AppHandle) -> Result<(), String> {
-    let window = menu_window(app)?;
+    #[cfg(target_os = "macos")]
+    {
+        let panel = menu_panel(app)?;
+        if panel.is_visible() {
+            panel.hide();
+            Ok(())
+        } else {
+            show_menu(app, None, None)
+        }
+    }
 
-    if window.is_visible().map_err(|error| error.to_string())? {
-        window.hide().map_err(|error| error.to_string())
-    } else {
-        show_menu(app, None, None)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let window = menu_window(app)?;
+        if window.is_visible().map_err(|error| error.to_string())? {
+            window.hide().map_err(|error| error.to_string())
+        } else {
+            show_menu(app, None, None)
+        }
     }
 }
 
@@ -179,6 +234,31 @@ fn register_menu_shortcut(app: &tauri::App) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn setup_menu_panel(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri_nspanel::{CollectionBehavior, PanelLevel, StyleMask, WebviewWindowExt};
+
+    app.handle()
+        .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+
+    let window = app
+        .get_webview_window(MENU_WINDOW_LABEL)
+        .expect("menu window should be created from tauri.conf.json");
+    let panel = window.to_panel::<QuickletPanel>()?;
+
+    panel.set_level(PanelLevel::Floating.value());
+    panel.add_style_mask(StyleMask::empty().nonactivating_panel().into())?;
+    panel.set_collection_behavior(
+        CollectionBehavior::new()
+            .full_screen_auxiliary()
+            .move_to_active_space()
+            .into(),
+    );
+    panel.set_hides_on_deactivate(false);
+
+    Ok(())
+}
+
 fn setup_menu_window(app: &tauri::App) -> tauri::Result<()> {
     let window = app
         .get_webview_window(MENU_WINDOW_LABEL)
@@ -200,6 +280,12 @@ fn setup_menu_window(app: &tauri::App) -> tauri::Result<()> {
                 .unwrap_or(true);
 
             if !within_grace_period {
+                #[cfg(target_os = "macos")]
+                if let Ok(panel) = menu_panel(&handle) {
+                    panel.hide();
+                }
+
+                #[cfg(not(target_os = "macos"))]
                 if let Some(window) = handle.get_webview_window(MENU_WINDOW_LABEL) {
                     let _ = window.hide();
                 }
@@ -229,7 +315,7 @@ fn create_dev_launcher(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .manage(MenuState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(
@@ -243,7 +329,12 @@ pub fn run() {
                     }
                 })
                 .build(),
-        )
+        );
+
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_nspanel::init());
+
+    builder
         .invoke_handler(tauri::generate_handler![
             open_menu,
             dismiss_menu,
@@ -252,6 +343,11 @@ pub fn run() {
         .setup(|app| {
             #[cfg(debug_assertions)]
             create_dev_launcher(app)?;
+
+            #[cfg(target_os = "macos")]
+            if let Err(error) = setup_menu_panel(app) {
+                eprintln!("quicklet: failed to configure macOS panel: {error}");
+            }
 
             setup_menu_window(app)?;
             register_menu_shortcut(app);
