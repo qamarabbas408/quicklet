@@ -87,3 +87,40 @@ export function QuickletMark({ className }: IconProps) {
     </svg>
   );
 }
+
+export function ChevronRightIcon({ className }: IconProps) {
+  return (
+    <svg {...outlineProps} className={className}>
+      <path d="m9 18 6-6-6-6" />
+    </svg>
+  );
+}
+
+export function ArrowUpIcon({ className }: IconProps) {
+  return (
+    <svg {...outlineProps} className={className}>
+      <path d="M12 19V5M5 12l7-7 7 7" />
+    </svg>
+  );
+}
+
+export function ArrowDownIcon({ className }: IconProps) {
+  return (
+    <svg {...outlineProps} className={className}>
+      <path d="M12 5v14M19 12l-7 7-7-7" />
+    </svg>
+  );
+}
+
+export function GripIcon({ className }: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className={className}>
+      <circle cx="9" cy="6" r="1.3" />
+      <circle cx="15" cy="6" r="1.3" />
+      <circle cx="9" cy="12" r="1.3" />
+      <circle cx="15" cy="12" r="1.3" />
+      <circle cx="9" cy="18" r="1.3" />
+      <circle cx="15" cy="18" r="1.3" />
+    </svg>
+  );
+}

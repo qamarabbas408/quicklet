@@ -25,3 +25,16 @@ export const actions: RadialAction[] = [
   { id: "tools", label: "Tools", icon: WrenchIcon, input: "any" },
   { id: "settings", label: "Settings", icon: SlidersIcon, input: "none" },
 ];
+
+export type ActionInfo = {
+  id: string;
+  label: string;
+  description: string;
+  enabled: boolean;
+  input: string | null;
+};
+
+export type OutputInfo = {
+  name: string;
+  directory: string;
+};

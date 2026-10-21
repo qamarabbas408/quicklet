@@ -10,6 +10,7 @@ export type InputSelection = {
   actionId: string;
   files: InputFile[];
   limit: number;
-  skipped: number;
+  duplicates: number;
+  limitSkipped: number;
   rejected: number;
 };

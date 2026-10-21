@@ -118,7 +118,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-height: 145px;
+  max-height: 110px;
   margin: 0;
   padding: 2px;
   overflow-y: auto;
@@ -343,4 +343,28 @@ body {
   .radial-item {
     transition: none;
   }
+}
+
+.action-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  padding: 2px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+}
+
+.action-list::-webkit-scrollbar {
+  width: 5px;
+}
+
+.action-list::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.action-list::-webkit-scrollbar-track {
+  background: transparent;
 }

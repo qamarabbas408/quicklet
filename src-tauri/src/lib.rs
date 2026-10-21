@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -47,8 +48,26 @@ struct InputState {
     next_id: Mutex<u64>,
     action_id: Mutex<Option<String>>,
     files: Mutex<Vec<InputFile>>,
-    picker_open: AtomicBool,
+    output_path: Mutex<Option<PathBuf>>,
+    dialog_open: AtomicBool,
     drop_mode: AtomicBool,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActionInfo {
+    id: String,
+    label: String,
+    description: String,
+    enabled: bool,
+    input: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutputInfo {
+    name: String,
+    directory: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -70,7 +89,8 @@ struct InputSelection {
     action_id: String,
     files: Vec<InputFile>,
     limit: usize,
-    skipped: usize,
+    duplicates: usize,
+    limit_skipped: usize,
     rejected: usize,
 }
 
@@ -131,12 +151,15 @@ fn get_menu_status(app: AppHandle) -> ShortcutStatus {
 async fn pick_input_files(
     app: AppHandle,
     window: WebviewWindow,
-    action_id: String,
     append: bool,
 ) -> Result<Option<InputSelection>, String> {
-    if action_id == "settings" {
-        return Err("Settings does not accept file input.".to_string());
-    }
+    let action_id = app
+        .state::<InputState>()
+        .action_id
+        .lock()
+        .map(|action_id| action_id.clone())
+        .unwrap_or(None)
+        .ok_or_else(|| "Choose an action first.".to_string())?;
 
     if append {
         let current_count = app
@@ -153,7 +176,7 @@ async fn pick_input_files(
     }
 
     app.state::<InputState>()
-        .picker_open
+        .dialog_open
         .store(true, Ordering::SeqCst);
 
     let mut dialog = app
@@ -174,7 +197,7 @@ async fn pick_input_files(
     let received = tauri::async_runtime::spawn_blocking(move || receiver.recv().ok().flatten()).await;
 
     app.state::<InputState>()
-        .picker_open
+        .dialog_open
         .store(false, Ordering::SeqCst);
     note_menu_shown(&app);
 
@@ -217,6 +240,145 @@ fn set_drop_mode(app: AppHandle, active: bool) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn get_category_actions(category_id: String) -> Vec<ActionInfo> {
+    category_actions(&category_id)
+}
+
+#[tauri::command]
+fn start_action(app: AppHandle, action_id: String) -> Result<ActionInfo, String> {
+    let action = find_action(&action_id).ok_or_else(|| "Unknown action.".to_string())?;
+
+    if !action.enabled {
+        return Err("This action is not available yet.".to_string());
+    }
+
+    let state = app.state::<InputState>();
+    let current_action = state
+        .action_id
+        .lock()
+        .map(|action_id| action_id.clone())
+        .unwrap_or(None);
+
+    if current_action.as_deref() != Some(action_id.as_str()) {
+        clear_input_state(&state);
+        if let Ok(mut stored_action) = state.action_id.lock() {
+            *stored_action = Some(action_id);
+        }
+    }
+
+    Ok(action)
+}
+
+#[tauri::command]
+fn get_input(app: AppHandle) -> InputSelection {
+    input_snapshot(&app.state::<InputState>())
+}
+
+#[tauri::command]
+fn reorder_input(app: AppHandle, ids: Vec<u64>) -> Result<InputSelection, String> {
+    let state = app.state::<InputState>();
+    let mut files = state
+        .files
+        .lock()
+        .map_err(|_| "Input state is unavailable.".to_string())?;
+    let mut by_id: HashMap<u64, InputFile> = files.drain(..).map(|file| (file.id, file)).collect();
+    let mut ordered = Vec::with_capacity(by_id.len());
+
+    for id in ids {
+        if let Some(file) = by_id.remove(&id) {
+            ordered.push(file);
+        }
+    }
+
+    let mut remaining: Vec<InputFile> = by_id.into_values().collect();
+    remaining.sort_by_key(|file| file.id);
+    ordered.extend(remaining);
+    *files = ordered;
+    drop(files);
+
+    Ok(input_snapshot(&state))
+}
+
+#[tauri::command]
+async fn choose_output(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<Option<OutputInfo>, String> {
+    let state = app.state::<InputState>();
+    let files = state
+        .files
+        .lock()
+        .map(|files| files.clone())
+        .unwrap_or_default();
+
+    if files.is_empty() {
+        return Err("Add files before choosing an output.".to_string());
+    }
+
+    state.dialog_open.store(true, Ordering::SeqCst);
+
+    let dialog = app
+        .dialog()
+        .file()
+        .set_title("Save PDF")
+        .set_parent(&window)
+        .add_filter("PDF", &["pdf"])
+        .set_file_name(default_output_name(&files));
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    dialog.save_file(move |path| {
+        let _ = sender.send(path);
+    });
+
+    let received = tauri::async_runtime::spawn_blocking(move || receiver.recv().ok().flatten()).await;
+
+    state.dialog_open.store(false, Ordering::SeqCst);
+    note_menu_shown(&app);
+
+    let picked = received.map_err(|error| error.to_string())?;
+    let Some(file_path) = picked else {
+        return Ok(None);
+    };
+
+    let path = ensure_pdf_extension(file_path.into_path().map_err(|error| error.to_string())?);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output.pdf".to_string());
+    let directory = path
+        .parent()
+        .map(|directory| directory.display().to_string())
+        .unwrap_or_default();
+
+    if let Ok(mut output_path) = state.output_path.lock() {
+        *output_path = Some(path);
+    }
+
+    Ok(Some(OutputInfo { name, directory }))
+}
+
+fn default_output_name(files: &[InputFile]) -> String {
+    files
+        .first()
+        .and_then(|file| file.path.file_stem())
+        .map(|stem| format!("{}.pdf", stem.to_string_lossy()))
+        .unwrap_or_else(|| "Quicklet.pdf".to_string())
+}
+
+fn ensure_pdf_extension(path: PathBuf) -> PathBuf {
+    let has_pdf_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
+
+    if has_pdf_extension {
+        path
+    } else {
+        path.with_extension("pdf")
+    }
+}
+
 fn ingest_paths(
     state: &InputState,
     action_id: &str,
@@ -240,7 +402,8 @@ fn ingest_paths(
 
     let mut next_id = state.next_id.lock().map(|id| *id).unwrap_or(0);
     let mut new_files: Vec<InputFile> = Vec::new();
-    let mut skipped: usize = 0;
+    let mut duplicates: usize = 0;
+    let mut limit_skipped: usize = 0;
     let mut rejected: usize = 0;
 
     for path in paths {
@@ -267,12 +430,12 @@ fn ingest_paths(
         if existing.iter().any(|file| file.path == path)
             || new_files.iter().any(|file| file.path == path)
         {
-            skipped += 1;
+            duplicates += 1;
             continue;
         }
 
         if new_files.len() >= capacity {
-            skipped += 1;
+            limit_skipped += 1;
             continue;
         }
 
@@ -310,10 +473,14 @@ fn ingest_paths(
         if let Ok(mut stored_action) = state.action_id.lock() {
             *stored_action = Some(action_id.to_string());
         }
+        if let Ok(mut output_path) = state.output_path.lock() {
+            *output_path = None;
+        }
     }
 
     let mut selection = input_snapshot(state);
-    selection.skipped = skipped;
+    selection.duplicates = duplicates;
+    selection.limit_skipped = limit_skipped;
     selection.rejected = rejected;
 
     IngestOutcome { selection, accepted }
@@ -397,13 +564,24 @@ fn remove_input_file(app: AppHandle, id: u64) -> InputSelection {
     if let Ok(mut files) = state.files.lock() {
         files.retain(|file| file.id != id);
     }
+    if let Ok(mut output_path) = state.output_path.lock() {
+        *output_path = None;
+    }
 
     input_snapshot(&state)
 }
 
 #[tauri::command]
 fn clear_input(app: AppHandle) -> Result<(), String> {
-    clear_input_state(&app.state::<InputState>());
+    let state = app.state::<InputState>();
+
+    if let Ok(mut files) = state.files.lock() {
+        files.clear();
+    }
+    if let Ok(mut output_path) = state.output_path.lock() {
+        *output_path = None;
+    }
+
     Ok(())
 }
 
@@ -424,7 +602,8 @@ fn input_snapshot(state: &InputState) -> InputSelection {
         action_id,
         files,
         limit: MAX_INPUT_FILES,
-        skipped: 0,
+        duplicates: 0,
+        limit_skipped: 0,
         rejected: 0,
     }
 }
@@ -436,23 +615,109 @@ fn clear_input_state(state: &InputState) {
     if let Ok(mut action_id) = state.action_id.lock() {
         *action_id = None;
     }
+    if let Ok(mut output_path) = state.output_path.lock() {
+        *output_path = None;
+    }
+}
+
+fn action_input_kind(action_id: &str) -> Option<&'static str> {
+    match action_id {
+        "images.convert_to_pdf" => Some("images"),
+        _ => None,
+    }
 }
 
 fn filter_for_action(action_id: &str) -> Option<(&'static str, &'static [&'static str])> {
-    match action_id {
-        "images" => Some((
+    match action_input_kind(action_id) {
+        Some("images") => Some((
             "Images",
-            &[
-                "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "heic", "avif",
-            ],
+            &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"],
         )),
-        "pdf" => Some(("PDF documents", &["pdf"])),
-        "documents" => Some((
+        Some("pdf") => Some(("PDF documents", &["pdf"])),
+        Some("documents") => Some((
             "Documents",
             &["pdf", "doc", "docx", "txt", "md", "markdown", "rtf", "odt"],
         )),
         _ => None,
     }
+}
+
+fn category_actions(category_id: &str) -> Vec<ActionInfo> {
+    let action = |id: &str, label: &str, description: &str, enabled: bool, input: Option<&str>| {
+        ActionInfo {
+            id: id.to_string(),
+            label: label.to_string(),
+            description: description.to_string(),
+            enabled,
+            input: input.map(str::to_string),
+        }
+    };
+
+    match category_id {
+        "images" => vec![
+            action(
+                "images.convert_to_pdf",
+                "Convert to PDF",
+                "Turn images into a PDF document",
+                true,
+                Some("images"),
+            ),
+            action(
+                "images.combine_to_pdf",
+                "Combine images into one PDF",
+                "Merge images into a single PDF",
+                false,
+                Some("images"),
+            ),
+            action(
+                "images.convert_format",
+                "Convert format",
+                "PNG, JPEG, WebP, and more",
+                false,
+                Some("images"),
+            ),
+            action(
+                "images.resize_compress",
+                "Resize or compress",
+                "Change dimensions or file size",
+                false,
+                Some("images"),
+            ),
+        ],
+        "pdf" => vec![
+            action("pdf.merge", "Merge PDFs", "Combine PDF documents", false, Some("pdf")),
+            action("pdf.split", "Split", "Split a PDF into pages", false, Some("pdf")),
+            action("pdf.compress", "Compress", "Reduce PDF file size", false, Some("pdf")),
+            action("pdf.extract_pages", "Extract pages", "Save selected pages", false, Some("pdf")),
+        ],
+        "compress" => vec![
+            action("compress.files", "Compress files", "Reduce file size", false, None),
+            action("compress.extract", "Extract archive", "Unpack an archive", false, None),
+        ],
+        "documents" => vec![
+            action("documents.convert", "Convert format", "Convert document formats", false, None),
+            action("documents.extract_text", "Extract text", "Save text from a document", false, None),
+        ],
+        "tools" => vec![
+            action("tools.utilities", "Quick utilities", "More tools coming soon", false, None),
+        ],
+        "settings" => vec![
+            action("settings.preferences", "Preferences", "Appearance and behavior", false, None),
+            action("settings.shortcuts", "Shortcuts", "Change the global shortcut", false, None),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn all_actions() -> Vec<ActionInfo> {
+    ["images", "pdf", "compress", "documents", "tools", "settings"]
+        .into_iter()
+        .flat_map(category_actions)
+        .collect()
+}
+
+fn find_action(action_id: &str) -> Option<ActionInfo> {
+    all_actions().into_iter().find(|action| action.id == action_id)
 }
 
 fn describe_kind(extension: Option<&str>) -> String {
@@ -593,7 +858,7 @@ fn compute_menu_position(
 fn toggle_menu(app: &AppHandle) -> Result<(), String> {
     if app
         .state::<InputState>()
-        .picker_open
+        .dialog_open
         .load(Ordering::SeqCst)
     {
         return Ok(());
@@ -695,7 +960,7 @@ fn setup_menu_window(app: &tauri::App) -> tauri::Result<()> {
                 })
                 .unwrap_or(true);
             let input_state = handle.state::<InputState>();
-            let input_busy = input_state.picker_open.load(Ordering::SeqCst)
+            let input_busy = input_state.dialog_open.load(Ordering::SeqCst)
                 || input_state.drop_mode.load(Ordering::SeqCst);
 
             if !input_busy && !within_grace_period {
@@ -805,7 +1070,12 @@ pub fn run() {
             pick_input_files,
             remove_input_file,
             clear_input,
-            set_drop_mode
+            set_drop_mode,
+            get_category_actions,
+            start_action,
+            get_input,
+            reorder_input,
+            choose_output
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]
@@ -890,18 +1160,14 @@ mod tests {
     #[test]
     fn applies_category_filters_only_where_defined() {
         let (images_name, images_extensions) =
-            super::filter_for_action("images").expect("images should have filters");
+            super::filter_for_action("images.convert_to_pdf").expect("images should have filters");
         assert_eq!(images_name, "Images");
         assert!(images_extensions.contains(&"png"));
         assert!(images_extensions.contains(&"webp"));
 
-        let (pdf_name, pdf_extensions) =
-            super::filter_for_action("pdf").expect("pdf should have filters");
-        assert_eq!(pdf_name, "PDF documents");
-        assert_eq!(pdf_extensions, &["pdf"]);
-
-        assert!(super::filter_for_action("compress").is_none());
-        assert!(super::filter_for_action("settings").is_none());
+        assert!(super::filter_for_action("pdf.merge").is_none());
+        assert!(super::filter_for_action("compress.files").is_none());
+        assert!(super::filter_for_action("settings.preferences").is_none());
     }
 
     #[test]
@@ -928,10 +1194,10 @@ mod tests {
 
     #[test]
     fn enforces_extension_filters_for_actions() {
-        assert!(super::extension_is_allowed("images", Some("png")));
-        assert!(!super::extension_is_allowed("images", Some("pdf")));
-        assert!(!super::extension_is_allowed("images", None));
-        assert!(super::extension_is_allowed("compress", Some("anything")));
+        assert!(super::extension_is_allowed("images.convert_to_pdf", Some("png")));
+        assert!(!super::extension_is_allowed("images.convert_to_pdf", Some("pdf")));
+        assert!(!super::extension_is_allowed("images.convert_to_pdf", None));
+        assert!(super::filter_for_action("compress.files").is_none());
     }
 
     #[test]
@@ -947,7 +1213,7 @@ mod tests {
         let state = super::InputState::default();
         let outcome = super::ingest_paths(
             &state,
-            "images",
+            "images.convert_to_pdf",
             vec![image.clone(), document, folder],
             false,
         );
@@ -962,6 +1228,45 @@ mod tests {
     }
 
     #[test]
+    fn action_catalog_exposes_one_enabled_image_action() {
+        let actions = super::category_actions("images");
+        let enabled: Vec<_> = actions.iter().filter(|action| action.enabled).collect();
+
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].id, "images.convert_to_pdf");
+        assert!(actions.iter().any(|action| !action.enabled));
+        assert!(super::find_action("images.convert_to_pdf").is_some());
+        assert!(super::find_action("images.convert_format").is_some());
+    }
+
+    #[test]
+    fn normalizes_pdf_output_paths() {
+        assert_eq!(
+            super::ensure_pdf_extension(std::path::PathBuf::from("/tmp/out")),
+            std::path::PathBuf::from("/tmp/out.pdf")
+        );
+        assert_eq!(
+            super::ensure_pdf_extension(std::path::PathBuf::from("/tmp/out.PDF")),
+            std::path::PathBuf::from("/tmp/out.PDF")
+        );
+    }
+
+    #[test]
+    fn defaults_output_name_from_first_file() {
+        let file = super::InputFile {
+            id: 1,
+            name: "photo.png".to_string(),
+            extension: Some("png".to_string()),
+            kind: "PNG image".to_string(),
+            size: Some(10),
+            path: std::path::PathBuf::from("/tmp/photo.png"),
+        };
+
+        assert_eq!(super::default_output_name(&[file]), "photo.pdf");
+        assert_eq!(super::default_output_name(&[]), "Quicklet.pdf");
+    }
+
+    #[test]
     fn ingestion_enforces_limit_and_deduplicates() {
         let dir = test_dir("limit");
         let mut paths = Vec::new();
@@ -972,16 +1277,16 @@ mod tests {
         }
 
         let state = super::InputState::default();
-        let outcome = super::ingest_paths(&state, "images", paths.clone(), false);
+        let outcome = super::ingest_paths(&state, "images.convert_to_pdf", paths.clone(), false);
 
         assert_eq!(outcome.accepted, super::MAX_INPUT_FILES);
         assert_eq!(outcome.selection.files.len(), super::MAX_INPUT_FILES);
-        assert_eq!(outcome.selection.skipped, 2);
+        assert_eq!(outcome.selection.limit_skipped, 2);
 
         let dedupe_state = super::InputState::default();
         let first = super::ingest_paths(
             &dedupe_state,
-            "images",
+            "images.convert_to_pdf",
             vec![paths[0].clone(), paths[1].clone()],
             false,
         );
@@ -989,12 +1294,12 @@ mod tests {
 
         let second = super::ingest_paths(
             &dedupe_state,
-            "images",
+            "images.convert_to_pdf",
             vec![paths[1].clone(), paths[2].clone()],
             true,
         );
         assert_eq!(second.selection.files.len(), 3);
-        assert_eq!(second.selection.skipped, 1);
+        assert_eq!(second.selection.duplicates, 1);
 
         std::fs::remove_dir_all(dir).expect("test directory should be removed");
     }

@@ -1,12 +1,20 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { ActionList } from "./ActionList";
 import { FileConfirmation } from "./FileConfirmation";
+import { OutputPanel } from "./OutputPanel";
 import { QuickletMark } from "./icons";
 import { RadialMenu } from "./RadialMenu";
-import type { RadialAction } from "../lib/actions";
-import { IS_TAURI, APP_NAME } from "../lib/constants";
+import type {
+  ActionInfo,
+  OutputInfo,
+  RadialAction,
+} from "../lib/actions";
+import { APP_NAME, IS_TAURI } from "../lib/constants";
 import type { InputSelection } from "../lib/input";
+
+type Stage = "radial" | "actions" | "input" | "review" | "output";
 
 type DragState = {
   active: boolean;
@@ -15,21 +23,38 @@ type DragState = {
 
 export function MenuWindow() {
   const [isOpen, setIsOpen] = useState(true);
+  const [stage, setStage] = useState<Stage>("radial");
   const [selectedAction, setSelectedAction] = useState<RadialAction | null>(
     null,
   );
+  const [actions, setActions] = useState<ActionInfo[]>([]);
+  const [actionsLoading, setActionsLoading] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [selectedOperation, setSelectedOperation] =
+    useState<ActionInfo | null>(null);
   const [inputSelection, setInputSelection] = useState<InputSelection | null>(
     null,
   );
+  const [outputInfo, setOutputInfo] = useState<OutputInfo | null>(null);
+  const [outputError, setOutputError] = useState<string | null>(null);
+  const [isChoosingOutput, setIsChoosingOutput] = useState(false);
   const [isPicking, setIsPicking] = useState(false);
   const [pickerError, setPickerError] = useState<string | null>(null);
   const [isDropMode, setIsDropMode] = useState(false);
   const [isDragActive, setIsDragActive] = useState(false);
   const [dragCount, setDragCount] = useState(0);
 
-  const resetInput = useCallback(() => {
-    setInputSelection(null);
+  const resetSession = useCallback(() => {
+    setStage("radial");
     setSelectedAction(null);
+    setActions([]);
+    setActionsLoading(false);
+    setActionError(null);
+    setSelectedOperation(null);
+    setInputSelection(null);
+    setOutputInfo(null);
+    setOutputError(null);
+    setIsChoosingOutput(false);
     setPickerError(null);
     setIsPicking(false);
     setIsDropMode(false);
@@ -38,7 +63,7 @@ export function MenuWindow() {
   }, []);
 
   const dismiss = useCallback(() => {
-    resetInput();
+    resetSession();
 
     if (IS_TAURI) {
       void invoke("dismiss_menu").catch(() => setIsOpen(false));
@@ -46,7 +71,7 @@ export function MenuWindow() {
     }
 
     setIsOpen(false);
-  }, [resetInput]);
+  }, [resetSession]);
 
   useEffect(() => {
     if (!IS_TAURI) return;
@@ -55,7 +80,7 @@ export function MenuWindow() {
     let unlisten: (() => void) | undefined;
 
     void listen("menu-opened", () => {
-      resetInput();
+      resetSession();
       setIsOpen(true);
     }).then((stopListening) => {
       if (disposed) {
@@ -69,7 +94,7 @@ export function MenuWindow() {
       disposed = true;
       unlisten?.();
     };
-  }, [resetInput]);
+  }, [resetSession]);
 
   useEffect(() => {
     if (!IS_TAURI) return;
@@ -90,6 +115,8 @@ export function MenuWindow() {
     track(
       listen<InputSelection>("input-updated", (event) => {
         setInputSelection(event.payload);
+        setOutputInfo(null);
+        setStage("input");
         setIsDropMode(false);
         setIsDragActive(false);
         setDragCount(0);
@@ -127,65 +154,122 @@ export function MenuWindow() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [isOpen, dismiss]);
 
-  const openPicker = useCallback(
-    async (action: RadialAction, append: boolean) => {
-      setIsPicking(true);
-      setPickerError(null);
+  const openCategory = useCallback(async (category: RadialAction) => {
+    setSelectedAction(category);
+    setActionError(null);
 
-      try {
-        const selection = await invoke<InputSelection | null>(
-          "pick_input_files",
-          { actionId: action.id, append },
-        );
+    if (!IS_TAURI) return;
 
-        if (selection && selection.files.length > 0) {
-          setSelectedAction(action);
-          setInputSelection(selection);
-        }
-      } catch (error) {
-        setPickerError(String(error));
-      } finally {
-        setIsPicking(false);
+    setStage("actions");
+    setActionsLoading(true);
+
+    try {
+      const list = await invoke<ActionInfo[]>("get_category_actions", {
+        categoryId: category.id,
+      });
+      setActions(list);
+    } catch (error) {
+      setActionError(String(error));
+      setActions([]);
+    } finally {
+      setActionsLoading(false);
+    }
+  }, []);
+
+  const chooseOperation = async (action: ActionInfo) => {
+    setActionError(null);
+
+    try {
+      const started = await invoke<ActionInfo>("start_action", {
+        actionId: action.id,
+      });
+      const selection = await invoke<InputSelection>("get_input");
+
+      if (selectedOperation?.id !== started.id) {
+        setOutputInfo(null);
+        setOutputError(null);
       }
-    },
-    [],
-  );
 
-  const selectAction = useCallback(
-    (action: RadialAction) => {
-      setSelectedAction(action);
-      setPickerError(null);
+      setSelectedOperation(started);
+      setInputSelection(selection);
+      setStage("input");
+    } catch (error) {
+      setActionError(String(error));
+    }
+  };
 
-      if (!IS_TAURI || action.input === "none") return;
-      void openPicker(action, false);
-    },
-    [openPicker],
-  );
+  const openPicker = useCallback(async (append: boolean) => {
+    setIsPicking(true);
+    setPickerError(null);
+
+    try {
+      const selection = await invoke<InputSelection | null>("pick_input_files", {
+        append,
+      });
+
+      if (selection && selection.files.length > 0) {
+        setInputSelection(selection);
+        setOutputInfo(null);
+        setStage("input");
+      }
+    } catch (error) {
+      setPickerError(String(error));
+    } finally {
+      setIsPicking(false);
+    }
+  }, []);
 
   const removeFile = async (id: number) => {
     try {
       const selection = await invoke<InputSelection>("remove_input_file", {
         id,
       });
-      setInputSelection(selection.files.length > 0 ? selection : null);
+      setInputSelection(selection);
+      setOutputInfo(null);
+      if (selection.files.length === 0) {
+        setStage("input");
+      }
     } catch (error) {
       setPickerError(String(error));
     }
   };
 
-  const backToMenu = () => {
-    if (IS_TAURI) {
-      void invoke("clear_input").catch(() => {});
+  const reorderFiles = async (ids: number[]) => {
+    try {
+      const selection = await invoke<InputSelection>("reorder_input", { ids });
+      setInputSelection(selection);
+    } catch (error) {
+      setPickerError(String(error));
     }
-    setInputSelection(null);
-    setPickerError(null);
   };
 
-  const clearAll = () => {
-    if (IS_TAURI) {
-      void invoke("clear_input").catch(() => {});
+  const clearAll = async () => {
+    try {
+      await invoke("clear_input");
+      const selection = await invoke<InputSelection>("get_input");
+      setInputSelection(selection);
+      setOutputInfo(null);
+      setOutputError(null);
+      setStage("input");
+    } catch (error) {
+      setPickerError(String(error));
     }
-    resetInput();
+  };
+
+  const chooseOutput = async () => {
+    setIsChoosingOutput(true);
+    setOutputError(null);
+
+    try {
+      const info = await invoke<OutputInfo | null>("choose_output");
+      if (info) {
+        setOutputInfo(info);
+      }
+    } catch (error) {
+      setOutputError(String(error));
+    } finally {
+      setIsChoosingOutput(false);
+    }
   };
 
   const enterDropMode = async () => {
@@ -214,47 +298,103 @@ export function MenuWindow() {
     }
   };
 
-  const chooseDifferentFiles = () => {
-    if (selectedAction) {
-      void openPicker(selectedAction, false);
-    }
+  const backToLauncher = () => {
+    setStage("radial");
+    setSelectedAction(null);
+    setActionError(null);
   };
 
-  const addMoreFiles = () => {
-    if (selectedAction) {
-      void openPicker(selectedAction, true);
-    }
+  const backToActions = () => {
+    setStage("actions");
+    setActionError(null);
   };
 
   const reopen = () => {
-    resetInput();
+    resetSession();
     setIsOpen(true);
   };
 
+  const showActions = stage === "actions" && selectedAction !== null;
+  const showInput =
+    stage === "input" && selectedOperation !== null && inputSelection !== null;
+  const showReview =
+    stage === "review" && selectedOperation !== null && inputSelection !== null;
+  const showOutput =
+    stage === "output" && selectedOperation !== null && inputSelection !== null;
+
   return (
     <main className="app-shell">
-      {inputSelection ? (
+      {showActions ? (
+        <ActionList
+          category={selectedAction}
+          actions={actions}
+          loading={actionsLoading}
+          error={actionError}
+          onSelect={(action) => void chooseOperation(action)}
+          onBack={backToLauncher}
+          onDismiss={dismiss}
+        />
+      ) : showInput ? (
         <FileConfirmation
           selection={inputSelection}
+          actionLabel={selectedOperation.label}
+          categoryIcon={selectedAction?.icon}
+          mode="input"
           isPicking={isPicking}
           isDropMode={isDropMode}
           isDragActive={isDragActive}
           dragCount={dragCount}
           error={pickerError}
           onRemove={(id) => void removeFile(id)}
-          onAddMore={addMoreFiles}
-          onReplace={chooseDifferentFiles}
-          onClearAll={clearAll}
-          onBack={backToMenu}
+          onAddMore={() => void openPicker(true)}
+          onReplace={() => void openPicker(false)}
+          onClearAll={() => void clearAll()}
+          onBack={backToActions}
           onEnterDrop={() => void enterDropMode()}
           onCancelDrop={cancelDropMode}
+          onContinue={() => setStage("review")}
+          onReorder={(ids) => void reorderFiles(ids)}
+          onDismiss={dismiss}
+        />
+      ) : showReview ? (
+        <FileConfirmation
+          selection={inputSelection}
+          actionLabel={selectedOperation.label}
+          categoryIcon={selectedAction?.icon}
+          mode="review"
+          isPicking={isPicking}
+          isDropMode={false}
+          isDragActive={false}
+          dragCount={0}
+          error={pickerError}
+          onRemove={(id) => void removeFile(id)}
+          onAddMore={() => {}}
+          onReplace={() => {}}
+          onClearAll={() => void clearAll()}
+          onBack={() => setStage("input")}
+          onEnterDrop={() => {}}
+          onCancelDrop={cancelDropMode}
+          onContinue={() => setStage("output")}
+          onReorder={(ids) => void reorderFiles(ids)}
+          onDismiss={dismiss}
+        />
+      ) : showOutput ? (
+        <OutputPanel
+          category={selectedAction}
+          actionLabel={selectedOperation.label}
+          selection={inputSelection}
+          output={outputInfo}
+          isChoosing={isChoosingOutput}
+          error={outputError}
+          onChooseOutput={() => void chooseOutput()}
+          onBack={() => setStage("review")}
           onDismiss={dismiss}
         />
       ) : isOpen ? (
         <>
           <RadialMenu
             selectedAction={selectedAction}
-            onSelect={selectAction}
+            onSelect={(action) => void openCategory(action)}
             onDismiss={dismiss}
           />
           {pickerError && (
