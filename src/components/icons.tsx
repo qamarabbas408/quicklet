@@ -66,6 +66,14 @@ export function SlidersIcon({ className }: IconProps) {
   );
 }
 
+export function CloseIcon({ className }: IconProps) {
+  return (
+    <svg {...outlineProps} className={className}>
+      <path d="M18 6 6 18M6 6l12 12" />
+    </svg>
+  );
+}
+
 export function QuickletMark({ className }: IconProps) {
   return (
     <svg

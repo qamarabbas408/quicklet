@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { APP_NAME } from "../lib/constants";
 import { QuickletMark } from "./icons";
 
 type MenuStatus = {
@@ -69,7 +70,7 @@ export function DevLauncher() {
           <QuickletMark className="h-4 w-4" />
         </span>
         <div className="leading-tight">
-          <h1 className="text-sm font-semibold text-white">Quicklet Dev</h1>
+          <h1 className="text-sm font-semibold text-white">{APP_NAME} Dev</h1>
           <p className="text-[11px] text-white/40">M2.3 shortcut harness</p>
         </div>
       </header>

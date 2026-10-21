@@ -1,4 +1,5 @@
 import { actions, type RadialAction } from "../lib/actions";
+import { APP_NAME } from "../lib/constants";
 import { QuickletMark } from "./icons";
 import { RadialMenuItem } from "./RadialMenuItem";
 
@@ -25,7 +26,7 @@ export function RadialMenu({
       <div className="radial-menu" role="group" aria-label="Quicklet actions">
         <div className="radial-center" aria-hidden="true">
           <QuickletMark className="h-5 w-5" />
-          <span>Quicklet</span>
+          <span>{APP_NAME}</span>
         </div>
 
         {actions.map((action, index) => (
