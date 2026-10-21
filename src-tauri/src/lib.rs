@@ -470,7 +470,7 @@ async fn convert_to_pdf(app: AppHandle) -> Result<ConversionResult, String> {
     let task_output = output.clone();
     let joined = tauri::async_runtime::spawn_blocking(move || {
         let _guard = ConversionBusyGuard { app: guard_app };
-        pdf::convert_images_to_pdf(&paths, &task_output)
+        pdf::convert_images_to_pdf_with_overwrite(&paths, &task_output)
     })
     .await;
 

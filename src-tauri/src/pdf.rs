@@ -134,6 +134,25 @@ struct PageImage {
 ///
 /// Input paths are read in order. Existing output files are never overwritten.
 pub fn convert_images_to_pdf(inputs: &[PathBuf], output: &Path) -> Result<PdfOutcome, PdfError> {
+    convert(inputs, output, false)
+}
+
+/// Like [`convert_images_to_pdf`], but replaces an existing output file.
+///
+/// Use this only after the user has explicitly confirmed replacement in a
+/// native save dialog.
+pub fn convert_images_to_pdf_with_overwrite(
+    inputs: &[PathBuf],
+    output: &Path,
+) -> Result<PdfOutcome, PdfError> {
+    convert(inputs, output, true)
+}
+
+fn convert(
+    inputs: &[PathBuf],
+    output: &Path,
+    allow_overwrite: bool,
+) -> Result<PdfOutcome, PdfError> {
     if inputs.is_empty() {
         return Err(PdfError::NoInputs);
     }
@@ -141,14 +160,14 @@ pub fn convert_images_to_pdf(inputs: &[PathBuf], output: &Path) -> Result<PdfOut
         return Err(PdfError::TooManyInputs { max: MAX_IMAGES });
     }
 
-    validate_output(output)?;
+    validate_output(output, allow_overwrite)?;
 
     let pages = inputs
         .iter()
         .map(|path| read_page(path))
         .collect::<Result<Vec<_>, _>>()?;
     let bytes = build_pdf(&pages);
-    write_safely(output, &bytes)?;
+    write_safely(output, &bytes, allow_overwrite)?;
 
     Ok(PdfOutcome {
         pages: pages.len(),
@@ -156,11 +175,19 @@ pub fn convert_images_to_pdf(inputs: &[PathBuf], output: &Path) -> Result<PdfOut
     })
 }
 
-fn validate_output(output: &Path) -> Result<(), PdfError> {
+fn validate_output(output: &Path, allow_overwrite: bool) -> Result<(), PdfError> {
     if output.exists() {
-        return Err(PdfError::OutputExists {
-            path: output.to_path_buf(),
-        });
+        if output.is_dir() {
+            return Err(PdfError::OutputWrite {
+                path: output.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::AlreadyExists, "output path is a directory"),
+            });
+        }
+        if !allow_overwrite {
+            return Err(PdfError::OutputExists {
+                path: output.to_path_buf(),
+            });
+        }
     }
 
     let parent = output
@@ -493,7 +520,7 @@ fn build_pdf(pages: &[PageImage]) -> Vec<u8> {
     pdf.finish()
 }
 
-fn write_safely(output: &Path, bytes: &[u8]) -> Result<(), PdfError> {
+fn write_safely(output: &Path, bytes: &[u8], allow_overwrite: bool) -> Result<(), PdfError> {
     let parent = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -516,7 +543,13 @@ fn write_safely(output: &Path, bytes: &[u8]) -> Result<(), PdfError> {
             source,
         })?;
 
-    match temp.persist_noclobber(output) {
+    let persisted = if allow_overwrite {
+        temp.persist(output)
+    } else {
+        temp.persist_noclobber(output)
+    };
+
+    match persisted {
         Ok(file) => {
             drop(file);
             if let Ok(directory) = fs::File::open(parent) {
@@ -525,7 +558,7 @@ fn write_safely(output: &Path, bytes: &[u8]) -> Result<(), PdfError> {
             Ok(())
         }
         Err(error) => {
-            if error.error.kind() == io::ErrorKind::AlreadyExists {
+            if !allow_overwrite && error.error.kind() == io::ErrorKind::AlreadyExists {
                 Err(PdfError::OutputExists {
                     path: output.to_path_buf(),
                 })
@@ -981,6 +1014,25 @@ mod tests {
 
         assert!(message.contains("WhatsApp Image 2026-09-10.pdf"));
         assert!(!message.contains("/very/long/path"));
+    }
+
+    #[test]
+    fn overwrites_existing_output_only_when_explicitly_allowed() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("image.png");
+        let output = dir.path().join("result.pdf");
+        write_png(&input, 20, 10, false);
+        fs::write(&output, b"old content").unwrap();
+
+        assert!(matches!(
+            convert_images_to_pdf(&[input.clone()], &output),
+            Err(PdfError::OutputExists { .. })
+        ));
+        assert_eq!(fs::read(&output).unwrap(), b"old content");
+
+        convert_images_to_pdf_with_overwrite(&[input], &output).unwrap();
+        let bytes = fs::read(&output).unwrap();
+        assert!(bytes.starts_with(b"%PDF"));
     }
 
     #[test]
