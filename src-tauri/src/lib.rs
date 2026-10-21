@@ -48,6 +48,7 @@ struct InputState {
     action_id: Mutex<Option<String>>,
     files: Mutex<Vec<InputFile>>,
     picker_open: AtomicBool,
+    drop_mode: AtomicBool,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -70,6 +71,19 @@ struct InputSelection {
     files: Vec<InputFile>,
     limit: usize,
     skipped: usize,
+    rejected: usize,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DragState {
+    active: bool,
+    count: usize,
+}
+
+struct IngestOutcome {
+    selection: InputSelection,
+    accepted: usize,
 }
 
 fn menu_shortcut() -> Shortcut {
@@ -165,14 +179,50 @@ async fn pick_input_files(
     note_menu_shown(&app);
 
     let picked = received.map_err(|error| error.to_string())?;
-    let Some(paths) = picked else {
+    let Some(file_paths) = picked else {
         return Ok(None);
     };
+    if file_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let paths: Vec<PathBuf> = file_paths
+        .into_iter()
+        .filter_map(|path| path.into_path().ok())
+        .collect();
     if paths.is_empty() {
         return Ok(None);
     }
 
     let state = app.state::<InputState>();
+    let outcome = ingest_paths(&state, &action_id, paths, append);
+
+    if !append && outcome.accepted == 0 {
+        return Err("No readable files were selected.".to_string());
+    }
+
+    Ok(Some(outcome.selection))
+}
+
+#[tauri::command]
+fn set_drop_mode(app: AppHandle, active: bool) -> Result<(), String> {
+    app.state::<InputState>()
+        .drop_mode
+        .store(active, Ordering::SeqCst);
+
+    if !active {
+        note_menu_shown(&app);
+    }
+
+    Ok(())
+}
+
+fn ingest_paths(
+    state: &InputState,
+    action_id: &str,
+    paths: Vec<PathBuf>,
+    append: bool,
+) -> IngestOutcome {
     let existing = if append {
         state
             .files
@@ -182,25 +232,47 @@ async fn pick_input_files(
     } else {
         Vec::new()
     };
-    let mut next_id = state.next_id.lock().map(|id| *id).unwrap_or(0);
-    let mut files: Vec<InputFile> = Vec::with_capacity(paths.len());
     let capacity = if append {
         MAX_INPUT_FILES.saturating_sub(existing.len())
     } else {
         MAX_INPUT_FILES
     };
-    let mut picked_count: usize = 0;
 
-    for file_path in paths {
-        let Ok(path) = file_path.into_path() else {
+    let mut next_id = state.next_id.lock().map(|id| *id).unwrap_or(0);
+    let mut new_files: Vec<InputFile> = Vec::new();
+    let mut skipped: usize = 0;
+    let mut rejected: usize = 0;
+
+    for path in paths {
+        let metadata = std::fs::metadata(&path).ok();
+        let is_directory = metadata
+            .as_ref()
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
+
+        if is_directory {
+            rejected += 1;
             continue;
-        };
-        picked_count += 1;
+        }
 
-        if files.len() >= capacity
-            || existing.iter().any(|file| file.path == path)
-            || files.iter().any(|file| file.path == path)
+        let extension = path
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_lowercase());
+
+        if !extension_is_allowed(action_id, extension.as_deref()) {
+            rejected += 1;
+            continue;
+        }
+
+        if existing.iter().any(|file| file.path == path)
+            || new_files.iter().any(|file| file.path == path)
         {
+            skipped += 1;
+            continue;
+        }
+
+        if new_files.len() >= capacity {
+            skipped += 1;
             continue;
         }
 
@@ -208,14 +280,11 @@ async fn pick_input_files(
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        let extension = path
-            .extension()
-            .map(|extension| extension.to_string_lossy().to_lowercase());
-        let size = std::fs::metadata(&path).ok().map(|metadata| metadata.len());
+        let size = metadata.map(|metadata| metadata.len());
         let id = next_id;
         next_id += 1;
 
-        files.push(InputFile {
+        new_files.push(InputFile {
             id,
             name,
             kind: describe_kind(extension.as_deref()),
@@ -225,29 +294,100 @@ async fn pick_input_files(
         });
     }
 
-    if let Ok(mut counter) = state.next_id.lock() {
-        *counter = next_id;
-    }
-    if files.is_empty() && !append {
-        return Err("No readable files were selected.".to_string());
-    }
+    let accepted = new_files.len();
 
-    let skipped = picked_count.saturating_sub(files.len());
-
-    if append {
-        if let Ok(mut stored_files) = state.files.lock() {
-            stored_files.extend(files);
+    if append || accepted > 0 {
+        if let Ok(mut counter) = state.next_id.lock() {
+            *counter = next_id;
         }
-    } else if let Ok(mut stored_files) = state.files.lock() {
-        *stored_files = files;
-    }
-    if let Ok(mut stored_action) = state.action_id.lock() {
-        *stored_action = Some(action_id);
+        if append {
+            if let Ok(mut stored_files) = state.files.lock() {
+                stored_files.extend(new_files);
+            }
+        } else if let Ok(mut stored_files) = state.files.lock() {
+            *stored_files = new_files;
+        }
+        if let Ok(mut stored_action) = state.action_id.lock() {
+            *stored_action = Some(action_id.to_string());
+        }
     }
 
-    let mut selection = input_snapshot(&state);
+    let mut selection = input_snapshot(state);
     selection.skipped = skipped;
-    Ok(Some(selection))
+    selection.rejected = rejected;
+
+    IngestOutcome { selection, accepted }
+}
+
+fn extension_is_allowed(action_id: &str, extension: Option<&str>) -> bool {
+    match filter_for_action(action_id) {
+        Some((_, allowed)) => extension.is_some_and(|extension| allowed.contains(&extension)),
+        None => true,
+    }
+}
+
+fn handle_file_drop(app: &AppHandle, paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+
+    let state = app.state::<InputState>();
+    let action_id = state
+        .action_id
+        .lock()
+        .map(|action_id| action_id.clone())
+        .unwrap_or(None);
+
+    state.drop_mode.store(false, Ordering::SeqCst);
+
+    let Some(action_id) = action_id else {
+        if let Some(window) = app.get_webview_window(MENU_WINDOW_LABEL) {
+            let _ = window.emit(
+                "input-drag",
+                DragState {
+                    active: false,
+                    count: 0,
+                },
+            );
+        }
+        return;
+    };
+
+    let outcome = ingest_paths(&state, &action_id, paths, true);
+
+    note_menu_shown(app);
+    focus_menu(app);
+
+    if let Some(window) = app.get_webview_window(MENU_WINDOW_LABEL) {
+        let _ = window.emit("input-updated", &outcome.selection);
+        let _ = window.emit(
+            "input-drag",
+            DragState {
+                active: false,
+                count: 0,
+            },
+        );
+    }
+}
+
+fn focus_menu(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    if let Ok(panel) = menu_panel(app) {
+        panel.show_and_make_key();
+    }
+
+    if let Some(window) = app.get_webview_window(MENU_WINDOW_LABEL) {
+        #[cfg(target_os = "macos")]
+        {
+            let webview: &tauri::Webview = window.as_ref();
+            let _ = webview.set_focus();
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = window.set_focus();
+        }
+    }
 }
 
 #[tauri::command]
@@ -285,6 +425,7 @@ fn input_snapshot(state: &InputState) -> InputSelection {
         files,
         limit: MAX_INPUT_FILES,
         skipped: 0,
+        rejected: 0,
     }
 }
 
@@ -462,6 +603,9 @@ fn toggle_menu(app: &AppHandle) -> Result<(), String> {
     {
         let panel = menu_panel(app)?;
         if panel.is_visible() {
+            app.state::<InputState>()
+                .drop_mode
+                .store(false, Ordering::SeqCst);
             panel.hide();
             Ok(())
         } else {
@@ -473,6 +617,9 @@ fn toggle_menu(app: &AppHandle) -> Result<(), String> {
     {
         let window = menu_window(app)?;
         if window.is_visible().map_err(|error| error.to_string())? {
+            app.state::<InputState>()
+                .drop_mode
+                .store(false, Ordering::SeqCst);
             window.hide().map_err(|error| error.to_string())
         } else {
             show_menu(app, None, None)
@@ -534,8 +681,8 @@ fn setup_menu_window(app: &tauri::App) -> tauri::Result<()> {
         .expect("menu window should be created from tauri.conf.json");
     let handle = app.handle().clone();
 
-    window.on_window_event(move |event| {
-        if let WindowEvent::Focused(false) = event {
+    window.on_window_event(move |event| match event {
+        WindowEvent::Focused(false) => {
             let state = handle.state::<MenuState>();
             let within_grace_period = state
                 .last_shown_at
@@ -547,13 +694,13 @@ fn setup_menu_window(app: &tauri::App) -> tauri::Result<()> {
                         .unwrap_or(true)
                 })
                 .unwrap_or(true);
-            let picker_open = handle
-                .state::<InputState>()
-                .picker_open
-                .load(Ordering::SeqCst);
+            let input_state = handle.state::<InputState>();
+            let input_busy = input_state.picker_open.load(Ordering::SeqCst)
+                || input_state.drop_mode.load(Ordering::SeqCst);
 
-            if !picker_open && !within_grace_period {
-                clear_input_state(&handle.state::<InputState>());
+            if !input_busy && !within_grace_period {
+                input_state.drop_mode.store(false, Ordering::SeqCst);
+                clear_input_state(&input_state);
 
                 #[cfg(target_os = "macos")]
                 if let Ok(panel) = menu_panel(&handle) {
@@ -566,6 +713,45 @@ fn setup_menu_window(app: &tauri::App) -> tauri::Result<()> {
                 }
             }
         }
+        WindowEvent::DragDrop(drag_event) => {
+            if !handle
+                .state::<InputState>()
+                .drop_mode
+                .load(Ordering::SeqCst)
+            {
+                return;
+            }
+
+            match drag_event {
+                tauri::DragDropEvent::Enter { paths, .. } => {
+                    if let Some(window) = handle.get_webview_window(MENU_WINDOW_LABEL) {
+                        let _ = window.emit(
+                            "input-drag",
+                            DragState {
+                                active: true,
+                                count: paths.len(),
+                            },
+                        );
+                    }
+                }
+                tauri::DragDropEvent::Leave => {
+                    if let Some(window) = handle.get_webview_window(MENU_WINDOW_LABEL) {
+                        let _ = window.emit(
+                            "input-drag",
+                            DragState {
+                                active: false,
+                                count: 0,
+                            },
+                        );
+                    }
+                }
+                tauri::DragDropEvent::Drop { paths, .. } => {
+                    handle_file_drop(&handle, paths.to_vec());
+                }
+                _ => {}
+            }
+        }
+        _ => {}
     });
 
     Ok(())
@@ -618,7 +804,8 @@ pub fn run() {
             get_menu_status,
             pick_input_files,
             remove_input_file,
-            clear_input
+            clear_input,
+            set_drop_mode
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]
@@ -636,6 +823,7 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -723,5 +911,91 @@ mod tests {
         assert_eq!(super::describe_kind(Some("pdf")), "PDF document");
         assert_eq!(super::describe_kind(Some("xyz")), "XYZ file");
         assert_eq!(super::describe_kind(None), "File");
+    }
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "quicklet-test-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory should be created");
+        dir
+    }
+
+    #[test]
+    fn enforces_extension_filters_for_actions() {
+        assert!(super::extension_is_allowed("images", Some("png")));
+        assert!(!super::extension_is_allowed("images", Some("pdf")));
+        assert!(!super::extension_is_allowed("images", None));
+        assert!(super::extension_is_allowed("compress", Some("anything")));
+    }
+
+    #[test]
+    fn ingestion_rejects_unsupported_files_and_directories() {
+        let dir = test_dir("reject");
+        let image = dir.join("photo.png");
+        let document = dir.join("document.pdf");
+        let folder = dir.join("folder");
+        std::fs::write(&image, b"x").expect("image should be written");
+        std::fs::write(&document, b"x").expect("document should be written");
+        std::fs::create_dir(&folder).expect("folder should be created");
+
+        let state = super::InputState::default();
+        let outcome = super::ingest_paths(
+            &state,
+            "images",
+            vec![image.clone(), document, folder],
+            false,
+        );
+
+        assert_eq!(outcome.accepted, 1);
+        assert_eq!(outcome.selection.rejected, 2);
+        assert_eq!(outcome.selection.files.len(), 1);
+        assert_eq!(outcome.selection.files[0].name, "photo.png");
+        assert_eq!(outcome.selection.files[0].kind, "PNG image");
+
+        std::fs::remove_dir_all(dir).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn ingestion_enforces_limit_and_deduplicates() {
+        let dir = test_dir("limit");
+        let mut paths = Vec::new();
+        for index in 0..10 {
+            let path = dir.join(format!("image-{index}.png"));
+            std::fs::write(&path, b"x").expect("image should be written");
+            paths.push(path);
+        }
+
+        let state = super::InputState::default();
+        let outcome = super::ingest_paths(&state, "images", paths.clone(), false);
+
+        assert_eq!(outcome.accepted, super::MAX_INPUT_FILES);
+        assert_eq!(outcome.selection.files.len(), super::MAX_INPUT_FILES);
+        assert_eq!(outcome.selection.skipped, 2);
+
+        let dedupe_state = super::InputState::default();
+        let first = super::ingest_paths(
+            &dedupe_state,
+            "images",
+            vec![paths[0].clone(), paths[1].clone()],
+            false,
+        );
+        assert_eq!(first.accepted, 2);
+
+        let second = super::ingest_paths(
+            &dedupe_state,
+            "images",
+            vec![paths[1].clone(), paths[2].clone()],
+            true,
+        );
+        assert_eq!(second.selection.files.len(), 3);
+        assert_eq!(second.selection.skipped, 1);
+
+        std::fs::remove_dir_all(dir).expect("test directory should be removed");
     }
 }

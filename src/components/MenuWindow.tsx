@@ -8,6 +8,11 @@ import type { RadialAction } from "../lib/actions";
 import { IS_TAURI, APP_NAME } from "../lib/constants";
 import type { InputSelection } from "../lib/input";
 
+type DragState = {
+  active: boolean;
+  count: number;
+};
+
 export function MenuWindow() {
   const [isOpen, setIsOpen] = useState(true);
   const [selectedAction, setSelectedAction] = useState<RadialAction | null>(
@@ -18,12 +23,18 @@ export function MenuWindow() {
   );
   const [isPicking, setIsPicking] = useState(false);
   const [pickerError, setPickerError] = useState<string | null>(null);
+  const [isDropMode, setIsDropMode] = useState(false);
+  const [isDragActive, setIsDragActive] = useState(false);
+  const [dragCount, setDragCount] = useState(0);
 
   const resetInput = useCallback(() => {
     setInputSelection(null);
     setSelectedAction(null);
     setPickerError(null);
     setIsPicking(false);
+    setIsDropMode(false);
+    setIsDragActive(false);
+    setDragCount(0);
   }, []);
 
   const dismiss = useCallback(() => {
@@ -59,6 +70,48 @@ export function MenuWindow() {
       unlisten?.();
     };
   }, [resetInput]);
+
+  useEffect(() => {
+    if (!IS_TAURI) return;
+
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+
+    const track = (listener: Promise<() => void>) => {
+      void listener.then((stopListening) => {
+        if (disposed) {
+          stopListening();
+        } else {
+          unlisteners.push(stopListening);
+        }
+      });
+    };
+
+    track(
+      listen<InputSelection>("input-updated", (event) => {
+        setInputSelection(event.payload);
+        setIsDropMode(false);
+        setIsDragActive(false);
+        setDragCount(0);
+        setIsPicking(false);
+        setPickerError(null);
+      }),
+    );
+
+    track(
+      listen<DragState>("input-drag", (event) => {
+        setIsDragActive(event.payload.active);
+        setDragCount(event.payload.count);
+      }),
+    );
+
+    return () => {
+      disposed = true;
+      for (const unlisten of unlisteners) {
+        unlisten();
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -128,6 +181,39 @@ export function MenuWindow() {
     setPickerError(null);
   };
 
+  const clearAll = () => {
+    if (IS_TAURI) {
+      void invoke("clear_input").catch(() => {});
+    }
+    resetInput();
+  };
+
+  const enterDropMode = async () => {
+    if (!IS_TAURI) return;
+
+    setIsDropMode(true);
+    setIsDragActive(false);
+    setDragCount(0);
+    setPickerError(null);
+
+    try {
+      await invoke("set_drop_mode", { active: true });
+    } catch (error) {
+      setIsDropMode(false);
+      setPickerError(String(error));
+    }
+  };
+
+  const cancelDropMode = () => {
+    setIsDropMode(false);
+    setIsDragActive(false);
+    setDragCount(0);
+
+    if (IS_TAURI) {
+      void invoke("set_drop_mode", { active: false }).catch(() => {});
+    }
+  };
+
   const chooseDifferentFiles = () => {
     if (selectedAction) {
       void openPicker(selectedAction, false);
@@ -151,11 +237,17 @@ export function MenuWindow() {
         <FileConfirmation
           selection={inputSelection}
           isPicking={isPicking}
+          isDropMode={isDropMode}
+          isDragActive={isDragActive}
+          dragCount={dragCount}
           error={pickerError}
           onRemove={(id) => void removeFile(id)}
           onAddMore={addMoreFiles}
           onReplace={chooseDifferentFiles}
+          onClearAll={clearAll}
           onBack={backToMenu}
+          onEnterDrop={() => void enterDropMode()}
+          onCancelDrop={cancelDropMode}
           onDismiss={dismiss}
         />
       ) : isOpen ? (

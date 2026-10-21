@@ -11,4 +11,5 @@ export type InputSelection = {
   files: InputFile[];
   limit: number;
   skipped: number;
+  rejected: number;
 };

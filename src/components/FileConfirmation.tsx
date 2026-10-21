@@ -6,22 +6,34 @@ import { CloseIcon } from "./icons";
 type FileConfirmationProps = {
   selection: InputSelection;
   isPicking: boolean;
+  isDropMode: boolean;
+  isDragActive: boolean;
+  dragCount: number;
   error: string | null;
   onRemove: (id: number) => void;
   onAddMore: () => void;
   onReplace: () => void;
+  onClearAll: () => void;
   onBack: () => void;
+  onEnterDrop: () => void;
+  onCancelDrop: () => void;
   onDismiss: () => void;
 };
 
 export function FileConfirmation({
   selection,
   isPicking,
+  isDropMode,
+  isDragActive,
+  dragCount,
   error,
   onRemove,
   onAddMore,
   onReplace,
+  onClearAll,
   onBack,
+  onEnterDrop,
+  onCancelDrop,
   onDismiss,
 }: FileConfirmationProps) {
   const action = actions.find((item) => item.id === selection.actionId);
@@ -43,14 +55,26 @@ export function FileConfirmation({
       }}
     >
       <section
-        className="confirmation-panel"
+        className="confirmation-panel relative"
         aria-labelledby="confirmation-title"
       >
-        <header className="flex items-start gap-3">
-          <span className="confirmation-icon">
+        <div
+          className="flex h-4 cursor-grab items-center justify-center active:cursor-grabbing"
+          data-tauri-drag-region
+          title="Drag to move Quicklet"
+        >
+          <span className="pointer-events-none h-1 w-12 rounded-full bg-white/25" />
+        </div>
+
+        <header
+          className="flex cursor-grab items-start gap-3 active:cursor-grabbing"
+          data-tauri-drag-region
+          title="Drag to move Quicklet"
+        >
+          <span className="confirmation-icon pointer-events-none">
             {ActionIcon ? <ActionIcon className="h-5 w-5" /> : null}
           </span>
-          <div className="min-w-0 flex-1">
+          <div className="pointer-events-none min-w-0 flex-1">
             <div className="flex items-baseline justify-between gap-2">
               <h2
                 id="confirmation-title"
@@ -112,6 +136,14 @@ export function FileConfirmation({
           </p>
         )}
 
+        {selection.rejected > 0 && (
+          <p role="status" className="text-[10px] text-amber-200/80">
+            {selection.rejected}{" "}
+            {selection.rejected === 1 ? "file was" : "files were"} rejected for
+            this action.
+          </p>
+        )}
+
         {error && (
           <p role="alert" className="text-[11px] text-red-300/90">
             {error}
@@ -121,25 +153,35 @@ export function FileConfirmation({
         <div className="flex gap-2">
           <button
             type="button"
-            className="flex-1 rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex-1 whitespace-nowrap rounded-lg border border-white/15 bg-white/10 px-2 py-2 text-xs font-medium text-white transition-colors hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 disabled:cursor-not-allowed disabled:opacity-50"
             disabled={isPicking || atLimit}
             onClick={onAddMore}
           >
-            {isPicking
-              ? "Opening picker…"
-              : atLimit
-                ? `Limit reached (${selection.limit})`
-                : "Add more files"}
+            {isPicking ? "Opening picker…" : "Add more files"}
           </button>
           <button
             type="button"
-            className="rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-white/70 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 disabled:opacity-50"
+            className="flex-1 whitespace-nowrap rounded-lg border border-white/10 bg-white/[0.04] px-2 py-2 text-xs text-white/70 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={isPicking || atLimit}
+            onClick={onEnterDrop}
+          >
+            Drop files
+          </button>
+          <button
+            type="button"
+            className="flex-1 whitespace-nowrap rounded-lg border border-white/10 bg-white/[0.04] px-2 py-2 text-xs text-white/70 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 disabled:opacity-50"
             disabled={isPicking}
             onClick={onReplace}
           >
             Replace files
           </button>
         </div>
+
+        {atLimit && (
+          <p className="text-[10px] text-white/35">
+            Limit reached ({selection.limit}). Remove a file to add more.
+          </p>
+        )}
 
         <div className="flex items-center justify-between text-[10px]">
           <button
@@ -150,8 +192,46 @@ export function FileConfirmation({
           >
             &larr; Back to menu
           </button>
-          <span className="text-white/30">Esc to dismiss</span>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              className="text-white/45 transition-colors hover:text-red-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-200/40 disabled:opacity-40"
+              disabled={isPicking}
+              onClick={onClearAll}
+            >
+              Clear all
+            </button>
+            <span className="text-white/30">Esc to dismiss</span>
+          </div>
         </div>
+
+        {isDropMode && (
+          <div
+            className={`absolute inset-0 z-20 flex cursor-grab flex-col items-center justify-center gap-2 rounded-[22px] border-2 border-dashed px-6 text-center backdrop-blur-md transition-colors active:cursor-grabbing ${
+              isDragActive
+                ? "border-emerald-300/70 bg-emerald-300/10"
+                : "border-white/25 bg-[#0c0f15]/90"
+            }`}
+            data-tauri-drag-region
+            title="Drag to move Quicklet"
+          >
+            <p className="pointer-events-none text-sm font-medium text-white/90">
+              {isDragActive
+                ? `${dragCount} ${dragCount === 1 ? "file" : "files"} detected`
+                : "Drop files here"}
+            </p>
+            <p className="pointer-events-none text-[11px] text-white/45">
+              Files will be added to this selection · max {selection.limit}
+            </p>
+            <button
+              type="button"
+              className="mt-2 rounded-lg border border-white/15 bg-white/10 px-3 py-1.5 text-[11px] text-white/80 transition-colors hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"
+              onClick={onCancelDrop}
+            >
+              Cancel drop
+            </button>
+          </div>
+        )}
       </section>
     </div>
   );

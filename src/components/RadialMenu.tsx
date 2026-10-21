@@ -24,9 +24,14 @@ export function RadialMenu({
       }}
     >
       <div className="radial-menu" role="group" aria-label="Quicklet actions">
-        <div className="radial-center" aria-hidden="true">
-          <QuickletMark className="h-5 w-5" />
-          <span>{APP_NAME}</span>
+        <div
+          className="radial-center"
+          data-tauri-drag-region
+          title="Drag to move Quicklet"
+          aria-hidden="true"
+        >
+          <QuickletMark className="pointer-events-none h-5 w-5" />
+          <span className="pointer-events-none">{APP_NAME}</span>
         </div>
 
         {actions.map((action, index) => (

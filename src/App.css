@@ -82,7 +82,7 @@ body {
 .confirmation-panel {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   width: min(100%, 404px);
   max-height: calc(100% - 24px);
   padding: 14px;
@@ -118,7 +118,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-height: 180px;
+  max-height: 145px;
   margin: 0;
   padding: 2px;
   overflow-y: auto;
@@ -201,6 +201,11 @@ body {
     inset 0 1px 0 rgba(255, 255, 255, 0.07),
     0 8px 24px -8px rgba(0, 0, 0, 0.6);
   color: rgba(255, 255, 255, 0.92);
+  cursor: grab;
+}
+
+.radial-center:active {
+  cursor: grabbing;
 }
 
 .radial-center span {
