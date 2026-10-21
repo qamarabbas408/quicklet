@@ -38,3 +38,10 @@ export type OutputInfo = {
   name: string;
   directory: string;
 };
+
+export type ConversionResult = {
+  pages: number;
+  bytesWritten: number;
+  name: string;
+  directory: string;
+};

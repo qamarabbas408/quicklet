@@ -71,7 +71,10 @@ export function ActionList({
         )}
 
         {!loading && error && (
-          <p role="alert" className="py-4 text-center text-xs text-red-300/90">
+          <p
+            role="alert"
+            className="max-h-20 shrink-0 overflow-y-auto py-4 text-center text-xs break-words text-red-300/90 [overflow-wrap:anywhere]"
+          >
             {error}
           </p>
         )}

@@ -259,7 +259,10 @@ export function FileConfirmation({
         )}
 
         {error && (
-          <p role="alert" className="text-[11px] text-red-300/90">
+          <p
+            role="alert"
+            className="max-h-20 shrink-0 overflow-y-auto text-[11px] break-words text-red-300/90 [overflow-wrap:anywhere]"
+          >
             {error}
           </p>
         )}

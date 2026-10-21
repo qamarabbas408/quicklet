@@ -1,4 +1,7 @@
+pub mod pdf;
+
 use std::collections::HashMap;
+use chrono::Local;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -6,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 const MENU_WINDOW_LABEL: &str = "main";
@@ -49,8 +53,40 @@ struct InputState {
     action_id: Mutex<Option<String>>,
     files: Mutex<Vec<InputFile>>,
     output_path: Mutex<Option<PathBuf>>,
+    last_output: Mutex<Option<PathBuf>>,
     dialog_open: AtomicBool,
     drop_mode: AtomicBool,
+    conversion_in_progress: AtomicBool,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversionResult {
+    pages: usize,
+    bytes_written: u64,
+    name: String,
+    directory: String,
+}
+
+struct ConversionBusyGuard {
+    app: AppHandle,
+}
+
+impl Drop for ConversionBusyGuard {
+    fn drop(&mut self) {
+        self.app
+            .state::<InputState>()
+            .conversion_in_progress
+            .store(false, Ordering::SeqCst);
+    }
+}
+
+fn ensure_not_converting(state: &InputState) -> Result<(), String> {
+    if state.conversion_in_progress.load(Ordering::SeqCst) {
+        Err("A conversion is already running.".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -122,6 +158,14 @@ fn open_menu(app: AppHandle, x: Option<f64>, y: Option<f64>) -> Result<(), Strin
 
 #[tauri::command]
 fn dismiss_menu(app: AppHandle) -> Result<(), String> {
+    if app
+        .state::<InputState>()
+        .conversion_in_progress
+        .load(Ordering::SeqCst)
+    {
+        return Ok(());
+    }
+
     clear_input_state(&app.state::<InputState>());
 
     #[cfg(target_os = "macos")]
@@ -153,6 +197,8 @@ async fn pick_input_files(
     window: WebviewWindow,
     append: bool,
 ) -> Result<Option<InputSelection>, String> {
+    ensure_not_converting(&app.state::<InputState>())?;
+
     let action_id = app
         .state::<InputState>()
         .action_id
@@ -229,6 +275,10 @@ async fn pick_input_files(
 
 #[tauri::command]
 fn set_drop_mode(app: AppHandle, active: bool) -> Result<(), String> {
+    if active {
+        ensure_not_converting(&app.state::<InputState>())?;
+    }
+
     app.state::<InputState>()
         .drop_mode
         .store(active, Ordering::SeqCst);
@@ -247,6 +297,8 @@ fn get_category_actions(category_id: String) -> Vec<ActionInfo> {
 
 #[tauri::command]
 fn start_action(app: AppHandle, action_id: String) -> Result<ActionInfo, String> {
+    ensure_not_converting(&app.state::<InputState>())?;
+
     let action = find_action(&action_id).ok_or_else(|| "Unknown action.".to_string())?;
 
     if !action.enabled {
@@ -278,6 +330,7 @@ fn get_input(app: AppHandle) -> InputSelection {
 #[tauri::command]
 fn reorder_input(app: AppHandle, ids: Vec<u64>) -> Result<InputSelection, String> {
     let state = app.state::<InputState>();
+    ensure_not_converting(&state)?;
     let mut files = state
         .files
         .lock()
@@ -306,6 +359,7 @@ async fn choose_output(
     window: WebviewWindow,
 ) -> Result<Option<OutputInfo>, String> {
     let state = app.state::<InputState>();
+    ensure_not_converting(&state)?;
     let files = state
         .files
         .lock()
@@ -324,7 +378,7 @@ async fn choose_output(
         .set_title("Save PDF")
         .set_parent(&window)
         .add_filter("PDF", &["pdf"])
-        .set_file_name(default_output_name(&files));
+        .set_file_name(default_output_name());
 
     let (sender, receiver) = std::sync::mpsc::channel();
     dialog.save_file(move |path| {
@@ -354,16 +408,130 @@ async fn choose_output(
     if let Ok(mut output_path) = state.output_path.lock() {
         *output_path = Some(path);
     }
+    if let Ok(mut last_output) = state.last_output.lock() {
+        *last_output = None;
+    }
 
     Ok(Some(OutputInfo { name, directory }))
 }
 
-fn default_output_name(files: &[InputFile]) -> String {
-    files
-        .first()
-        .and_then(|file| file.path.file_stem())
-        .map(|stem| format!("{}.pdf", stem.to_string_lossy()))
-        .unwrap_or_else(|| "Quicklet.pdf".to_string())
+#[tauri::command]
+async fn convert_to_pdf(app: AppHandle) -> Result<ConversionResult, String> {
+    let (paths, output) = {
+        let state = app.state::<InputState>();
+        ensure_not_converting(&state)?;
+
+        let action_id = state
+            .action_id
+            .lock()
+            .map(|action_id| action_id.clone())
+            .unwrap_or(None)
+            .ok_or_else(|| "Choose an action first.".to_string())?;
+
+        if action_id != "images.convert_to_pdf" {
+            return Err("This action is not available yet.".to_string());
+        }
+
+        let files = state
+            .files
+            .lock()
+            .map(|files| files.clone())
+            .unwrap_or_default();
+
+        if files.is_empty() {
+            return Err("Add images before converting.".to_string());
+        }
+
+        let output = state
+            .output_path
+            .lock()
+            .map(|output| output.clone())
+            .unwrap_or(None)
+            .ok_or_else(|| "Choose an output destination first.".to_string())?;
+
+        if state
+            .conversion_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("A conversion is already running.".to_string());
+        }
+
+        (
+            files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>(),
+            output,
+        )
+    };
+
+    let guard_app = app.clone();
+    let task_output = output.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ConversionBusyGuard { app: guard_app };
+        pdf::convert_images_to_pdf(&paths, &task_output)
+    })
+    .await;
+
+    let outcome = match joined {
+        Ok(result) => result.map_err(|error| error.to_string())?,
+        Err(error) => {
+            app.state::<InputState>()
+                .conversion_in_progress
+                .store(false, Ordering::SeqCst);
+            return Err(error.to_string());
+        }
+    };
+
+    if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
+        *last_output = Some(output.clone());
+    }
+
+    let name = output
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output.pdf".to_string());
+    let directory = output
+        .parent()
+        .map(|directory| directory.display().to_string())
+        .unwrap_or_default();
+
+    Ok(ConversionResult {
+        pages: outcome.pages,
+        bytes_written: outcome.bytes_written,
+        name,
+        directory,
+    })
+}
+
+fn last_output_path(state: &InputState) -> Result<PathBuf, String> {
+    state
+        .last_output
+        .lock()
+        .map(|output| output.clone())
+        .unwrap_or(None)
+        .ok_or_else(|| "No converted PDF yet.".to_string())
+}
+
+#[tauri::command]
+fn reveal_output(app: AppHandle) -> Result<(), String> {
+    let path = last_output_path(&app.state::<InputState>())?;
+    app.opener()
+        .reveal_item_in_dir(path)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_output(app: AppHandle) -> Result<(), String> {
+    let path = last_output_path(&app.state::<InputState>())?;
+    app.opener()
+        .open_path(path.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|error| error.to_string())
+}
+
+fn default_output_name() -> String {
+    format!("Quicklet-{}.pdf", Local::now().format("%Y-%m-%d"))
 }
 
 fn ensure_pdf_extension(path: PathBuf) -> PathBuf {
@@ -476,6 +644,9 @@ fn ingest_paths(
         if let Ok(mut output_path) = state.output_path.lock() {
             *output_path = None;
         }
+        if let Ok(mut last_output) = state.last_output.lock() {
+            *last_output = None;
+        }
     }
 
     let mut selection = input_snapshot(state);
@@ -558,8 +729,9 @@ fn focus_menu(app: &AppHandle) {
 }
 
 #[tauri::command]
-fn remove_input_file(app: AppHandle, id: u64) -> InputSelection {
+fn remove_input_file(app: AppHandle, id: u64) -> Result<InputSelection, String> {
     let state = app.state::<InputState>();
+    ensure_not_converting(&state)?;
 
     if let Ok(mut files) = state.files.lock() {
         files.retain(|file| file.id != id);
@@ -567,19 +739,26 @@ fn remove_input_file(app: AppHandle, id: u64) -> InputSelection {
     if let Ok(mut output_path) = state.output_path.lock() {
         *output_path = None;
     }
+    if let Ok(mut last_output) = state.last_output.lock() {
+        *last_output = None;
+    }
 
-    input_snapshot(&state)
+    Ok(input_snapshot(&state))
 }
 
 #[tauri::command]
 fn clear_input(app: AppHandle) -> Result<(), String> {
     let state = app.state::<InputState>();
+    ensure_not_converting(&state)?;
 
     if let Ok(mut files) = state.files.lock() {
         files.clear();
     }
     if let Ok(mut output_path) = state.output_path.lock() {
         *output_path = None;
+    }
+    if let Ok(mut last_output) = state.last_output.lock() {
+        *last_output = None;
     }
 
     Ok(())
@@ -609,6 +788,10 @@ fn input_snapshot(state: &InputState) -> InputSelection {
 }
 
 fn clear_input_state(state: &InputState) {
+    if state.conversion_in_progress.load(Ordering::SeqCst) {
+        return;
+    }
+
     if let Ok(mut files) = state.files.lock() {
         files.clear();
     }
@@ -617,6 +800,9 @@ fn clear_input_state(state: &InputState) {
     }
     if let Ok(mut output_path) = state.output_path.lock() {
         *output_path = None;
+    }
+    if let Ok(mut last_output) = state.last_output.lock() {
+        *last_output = None;
     }
 }
 
@@ -753,6 +939,14 @@ fn menu_panel(app: &AppHandle) -> Result<tauri_nspanel::PanelHandle<tauri::Wry>,
 }
 
 fn show_menu(app: &AppHandle, x: Option<f64>, y: Option<f64>) -> Result<(), String> {
+    if app
+        .state::<InputState>()
+        .conversion_in_progress
+        .load(Ordering::SeqCst)
+    {
+        return Ok(());
+    }
+
     let window = menu_window(app)?;
 
     let cursor = match (x, y) {
@@ -856,10 +1050,9 @@ fn compute_menu_position(
 }
 
 fn toggle_menu(app: &AppHandle) -> Result<(), String> {
-    if app
-        .state::<InputState>()
-        .dialog_open
-        .load(Ordering::SeqCst)
+    let input_state = app.state::<InputState>();
+    if input_state.dialog_open.load(Ordering::SeqCst)
+        || input_state.conversion_in_progress.load(Ordering::SeqCst)
     {
         return Ok(());
     }
@@ -961,7 +1154,8 @@ fn setup_menu_window(app: &tauri::App) -> tauri::Result<()> {
                 .unwrap_or(true);
             let input_state = handle.state::<InputState>();
             let input_busy = input_state.dialog_open.load(Ordering::SeqCst)
-                || input_state.drop_mode.load(Ordering::SeqCst);
+                || input_state.drop_mode.load(Ordering::SeqCst)
+                || input_state.conversion_in_progress.load(Ordering::SeqCst);
 
             if !input_busy && !within_grace_period {
                 input_state.drop_mode.store(false, Ordering::SeqCst);
@@ -1075,7 +1269,10 @@ pub fn run() {
             start_action,
             get_input,
             reorder_input,
-            choose_output
+            choose_output,
+            convert_to_pdf,
+            reveal_output,
+            open_output
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]
@@ -1097,7 +1294,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_menu_position;
+    use super::{compute_menu_position, ensure_not_converting, InputState};
+    use std::sync::atomic::Ordering;
 
     const WINDOW: (u32, u32) = (440, 440);
     const MARGIN: i32 = 8;
@@ -1228,6 +1426,21 @@ mod tests {
     }
 
     #[test]
+    fn busy_guard_rejects_duplicate_conversion_work() {
+        let state = InputState::default();
+        assert!(ensure_not_converting(&state).is_ok());
+
+        state.conversion_in_progress.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            ensure_not_converting(&state),
+            Err(message) if message == "A conversion is already running."
+        ));
+
+        state.conversion_in_progress.store(false, Ordering::SeqCst);
+        assert!(ensure_not_converting(&state).is_ok());
+    }
+
+    #[test]
     fn action_catalog_exposes_one_enabled_image_action() {
         let actions = super::category_actions("images");
         let enabled: Vec<_> = actions.iter().filter(|action| action.enabled).collect();
@@ -1252,18 +1465,15 @@ mod tests {
     }
 
     #[test]
-    fn defaults_output_name_from_first_file() {
-        let file = super::InputFile {
-            id: 1,
-            name: "photo.png".to_string(),
-            extension: Some("png".to_string()),
-            kind: "PNG image".to_string(),
-            size: Some(10),
-            path: std::path::PathBuf::from("/tmp/photo.png"),
-        };
+    fn defaults_output_name_to_quicklet_date() {
+        let expected = format!(
+            "Quicklet-{}.pdf",
+            chrono::Local::now().format("%Y-%m-%d")
+        );
 
-        assert_eq!(super::default_output_name(&[file]), "photo.pdf");
-        assert_eq!(super::default_output_name(&[]), "Quicklet.pdf");
+        assert_eq!(super::default_output_name(), expected);
+        assert!(super::default_output_name().starts_with("Quicklet-"));
+        assert!(super::default_output_name().ends_with(".pdf"));
     }
 
     #[test]

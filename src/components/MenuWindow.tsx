@@ -8,6 +8,7 @@ import { QuickletMark } from "./icons";
 import { RadialMenu } from "./RadialMenu";
 import type {
   ActionInfo,
+  ConversionResult,
   OutputInfo,
   RadialAction,
 } from "../lib/actions";
@@ -38,6 +39,13 @@ export function MenuWindow() {
   const [outputInfo, setOutputInfo] = useState<OutputInfo | null>(null);
   const [outputError, setOutputError] = useState<string | null>(null);
   const [isChoosingOutput, setIsChoosingOutput] = useState(false);
+  const [isConverting, setIsConverting] = useState(false);
+  const [conversionResult, setConversionResult] =
+    useState<ConversionResult | null>(null);
+  const [conversionError, setConversionError] = useState<string | null>(null);
+  const [resultActionError, setResultActionError] = useState<string | null>(
+    null,
+  );
   const [isPicking, setIsPicking] = useState(false);
   const [pickerError, setPickerError] = useState<string | null>(null);
   const [isDropMode, setIsDropMode] = useState(false);
@@ -55,6 +63,10 @@ export function MenuWindow() {
     setOutputInfo(null);
     setOutputError(null);
     setIsChoosingOutput(false);
+    setIsConverting(false);
+    setConversionResult(null);
+    setConversionError(null);
+    setResultActionError(null);
     setPickerError(null);
     setIsPicking(false);
     setIsDropMode(false);
@@ -63,6 +75,8 @@ export function MenuWindow() {
   }, []);
 
   const dismiss = useCallback(() => {
+    if (isConverting) return;
+
     resetSession();
 
     if (IS_TAURI) {
@@ -71,7 +85,7 @@ export function MenuWindow() {
     }
 
     setIsOpen(false);
-  }, [resetSession]);
+  }, [isConverting, resetSession]);
 
   useEffect(() => {
     if (!IS_TAURI) return;
@@ -178,6 +192,9 @@ export function MenuWindow() {
 
   const chooseOperation = async (action: ActionInfo) => {
     setActionError(null);
+    setConversionResult(null);
+    setConversionError(null);
+    setResultActionError(null);
 
     try {
       const started = await invoke<ActionInfo>("start_action", {
@@ -210,6 +227,9 @@ export function MenuWindow() {
       if (selection && selection.files.length > 0) {
         setInputSelection(selection);
         setOutputInfo(null);
+        setConversionResult(null);
+        setConversionError(null);
+        setResultActionError(null);
         setStage("input");
       }
     } catch (error) {
@@ -226,6 +246,9 @@ export function MenuWindow() {
       });
       setInputSelection(selection);
       setOutputInfo(null);
+      setConversionResult(null);
+      setConversionError(null);
+      setResultActionError(null);
       if (selection.files.length === 0) {
         setStage("input");
       }
@@ -238,6 +261,9 @@ export function MenuWindow() {
     try {
       const selection = await invoke<InputSelection>("reorder_input", { ids });
       setInputSelection(selection);
+      setConversionResult(null);
+      setConversionError(null);
+      setResultActionError(null);
     } catch (error) {
       setPickerError(String(error));
     }
@@ -250,6 +276,9 @@ export function MenuWindow() {
       setInputSelection(selection);
       setOutputInfo(null);
       setOutputError(null);
+      setConversionResult(null);
+      setConversionError(null);
+      setResultActionError(null);
       setStage("input");
     } catch (error) {
       setPickerError(String(error));
@@ -259,6 +288,9 @@ export function MenuWindow() {
   const chooseOutput = async () => {
     setIsChoosingOutput(true);
     setOutputError(null);
+    setConversionResult(null);
+    setConversionError(null);
+    setResultActionError(null);
 
     try {
       const info = await invoke<OutputInfo | null>("choose_output");
@@ -270,6 +302,42 @@ export function MenuWindow() {
     } finally {
       setIsChoosingOutput(false);
     }
+  };
+
+  const convert = async () => {
+    if (isConverting) return;
+
+    setIsConverting(true);
+    setConversionError(null);
+    setConversionResult(null);
+    setResultActionError(null);
+
+    try {
+      const result = await invoke<ConversionResult>("convert_to_pdf");
+      setConversionResult(result);
+    } catch (error) {
+      setConversionError(String(error));
+    } finally {
+      setIsConverting(false);
+    }
+  };
+
+  const runResultAction = async (command: "reveal_output" | "open_output") => {
+    setResultActionError(null);
+
+    try {
+      await invoke(command);
+    } catch (error) {
+      setResultActionError(String(error));
+    }
+  };
+
+  const backToReview = () => {
+    if (isConverting) return;
+    setConversionResult(null);
+    setConversionError(null);
+    setResultActionError(null);
+    setStage("review");
   };
 
   const enterDropMode = async () => {
@@ -385,9 +453,15 @@ export function MenuWindow() {
           selection={inputSelection}
           output={outputInfo}
           isChoosing={isChoosingOutput}
-          error={outputError}
+          isConverting={isConverting}
+          result={conversionResult}
+          error={conversionError ?? outputError}
+          resultError={resultActionError}
           onChooseOutput={() => void chooseOutput()}
-          onBack={() => setStage("review")}
+          onConvert={() => void convert()}
+          onReveal={() => void runResultAction("reveal_output")}
+          onOpen={() => void runResultAction("open_output")}
+          onBack={backToReview}
           onDismiss={dismiss}
         />
       ) : isOpen ? (
@@ -401,7 +475,7 @@ export function MenuWindow() {
             <div className="pointer-events-none absolute inset-x-0 top-4 z-10 flex justify-center px-4">
               <p
                 role="alert"
-                className="rounded-full border border-red-300/20 bg-red-950/70 px-3 py-1.5 text-[11px] text-red-200 backdrop-blur"
+                className="max-h-20 max-w-full overflow-y-auto rounded-2xl border border-red-300/20 bg-red-950/70 px-3 py-1.5 text-[11px] break-words text-red-200 backdrop-blur [overflow-wrap:anywhere]"
               >
                 {pickerError}
               </p>

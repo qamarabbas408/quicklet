@@ -1,6 +1,10 @@
-import type { OutputInfo, RadialAction } from "../lib/actions";
+import type {
+  ConversionResult,
+  OutputInfo,
+  RadialAction,
+} from "../lib/actions";
 import type { InputSelection } from "../lib/input";
-import { formatFileCount } from "../lib/format";
+import { formatBytes, formatFileCount } from "../lib/format";
 
 type OutputPanelProps = {
   category: RadialAction | null;
@@ -8,8 +12,14 @@ type OutputPanelProps = {
   selection: InputSelection;
   output: OutputInfo | null;
   isChoosing: boolean;
+  isConverting: boolean;
+  result: ConversionResult | null;
   error: string | null;
+  resultError: string | null;
   onChooseOutput: () => void;
+  onConvert: () => void;
+  onReveal: () => void;
+  onOpen: () => void;
   onBack: () => void;
   onDismiss: () => void;
 };
@@ -20,12 +30,22 @@ export function OutputPanel({
   selection,
   output,
   isChoosing,
+  isConverting,
+  result,
   error,
+  resultError,
   onChooseOutput,
+  onConvert,
+  onReveal,
+  onOpen,
   onBack,
   onDismiss,
 }: OutputPanelProps) {
   const CategoryIcon = category?.icon;
+  const revealLabel = /Mac/i.test(navigator.userAgent)
+    ? "Reveal in Finder"
+    : "Show in folder";
+  const canConvert = output !== null && !isChoosing && !isConverting;
 
   return (
     <div
@@ -61,80 +81,141 @@ export function OutputPanel({
               id="output-title"
               className="truncate text-sm font-semibold text-white"
             >
-              Output
+              {result ? "PDF created" : "Output"}
             </h2>
             <p className="mt-0.5 text-[11px] text-white/45">{actionLabel}</p>
           </div>
         </header>
 
-        <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-white/45">Format</span>
-            <span className="text-white/85">PDF</span>
-          </div>
-          <div className="mt-1 flex items-center justify-between text-[11px]">
-            <span className="text-white/45">Images</span>
-            <span className="text-white/85">
-              {formatFileCount(selection.files.length)}
-            </span>
-          </div>
-          <div className="mt-1 flex items-center justify-between text-[11px]">
-            <span className="text-white/45">Layout</span>
-            <span className="text-white/85">
-              A4 portrait · fit with margins
-            </span>
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
-          <p className="text-[10px] uppercase tracking-wide text-white/35">
-            Save to
-          </p>
-          {output ? (
-            <>
-              <p className="mt-1 truncate text-xs font-medium text-white/85">
-                {output.name}
+        {result ? (
+          <>
+            <div className="rounded-xl border border-emerald-300/15 bg-emerald-300/[0.06] px-3 py-3">
+              <p className="text-xs font-medium text-emerald-200/90">
+                {result.name}
               </p>
-              <p className="mt-0.5 truncate text-[10px] text-white/35">
-                {output.directory}
+              <p className="mt-1 truncate text-[10px] text-white/40">
+                {result.directory}
               </p>
-            </>
-          ) : (
-            <p className="mt-1 text-xs text-white/45">No destination selected</p>
-          )}
-        </div>
+              <p className="mt-2 text-[10px] text-white/45">
+                {result.pages} {result.pages === 1 ? "page" : "pages"} ·{" "}
+                {formatBytes(result.bytesWritten)}
+              </p>
+            </div>
 
-        {error && (
-          <p role="alert" className="text-[11px] text-red-300/90">
-            {error}
-          </p>
+            {resultError && (
+              <p
+                role="alert"
+                className="max-h-20 shrink-0 overflow-y-auto text-[11px] break-words text-red-300/90 [overflow-wrap:anywhere]"
+              >
+                {resultError}
+              </p>
+            )}
+
+            <button
+              type="button"
+              className="w-full rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"
+              onClick={onReveal}
+            >
+              {revealLabel}
+            </button>
+            <button
+              type="button"
+              className="w-full rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-white/70 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"
+              onClick={onOpen}
+            >
+              Open PDF
+            </button>
+          </>
+        ) : (
+          <>
+            <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="text-white/45">Format</span>
+                <span className="text-white/85">PDF</span>
+              </div>
+              <div className="mt-1 flex items-center justify-between text-[11px]">
+                <span className="text-white/45">Images</span>
+                <span className="text-white/85">
+                  {formatFileCount(selection.files.length)}
+                </span>
+              </div>
+              <div className="mt-1 flex items-center justify-between text-[11px]">
+                <span className="text-white/45">Layout</span>
+                <span className="text-white/85">
+                  A4 portrait · fit with margins
+                </span>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+              <p className="text-[10px] uppercase tracking-wide text-white/35">
+                Save to
+              </p>
+              {output ? (
+                <>
+                  <p className="mt-1 truncate text-xs font-medium text-white/85">
+                    {output.name}
+                  </p>
+                  <p className="mt-0.5 truncate text-[10px] text-white/35">
+                    {output.directory}
+                  </p>
+                </>
+              ) : (
+                <p className="mt-1 text-xs text-white/45">
+                  No destination selected
+                </p>
+              )}
+            </div>
+
+            {error && (
+              <p
+                role="alert"
+                className="max-h-20 shrink-0 overflow-y-auto text-[11px] break-words text-red-300/90 [overflow-wrap:anywhere]"
+              >
+                {error}
+              </p>
+            )}
+
+            {isConverting && (
+              <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-[11px] text-white/60">
+                <span className="conversion-spinner" />
+                Creating PDF…
+              </div>
+            )}
+
+            <button
+              type="button"
+              className="w-full rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={isChoosing || isConverting}
+              onClick={onChooseOutput}
+            >
+              {isChoosing
+                ? "Choosing destination…"
+                : output
+                  ? "Change destination"
+                  : "Choose destination"}
+            </button>
+
+            <button
+              type="button"
+              className="w-full rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={!canConvert}
+              onClick={onConvert}
+            >
+              {isConverting
+                ? "Creating PDF…"
+                : error
+                  ? "Retry conversion"
+                  : "Convert to PDF"}
+            </button>
+          </>
         )}
-
-        <button
-          type="button"
-          className="w-full rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 disabled:opacity-50"
-          disabled={isChoosing}
-          onClick={onChooseOutput}
-        >
-          {isChoosing
-            ? "Choosing destination…"
-            : output
-              ? "Change destination"
-              : "Choose destination"}
-        </button>
-
-        <button
-          type="button"
-          disabled
-          className="w-full cursor-not-allowed rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-white/35"
-        >
-          Convert · coming in M4.1
-        </button>
 
         <div className="flex items-center justify-between text-[10px]">
           <button
             type="button"
-            className="text-white/45 transition-colors hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
+            className="text-white/45 transition-colors hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30 disabled:opacity-40"
+            disabled={isConverting}
             onClick={onBack}
           >
             &larr; Review files
