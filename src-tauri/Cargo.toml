@@ -29,6 +29,7 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 miniz_oxide = "0.9"
 kamadak-exif = "0.6"
 tempfile = "3"
+lopdf = "0.46"
 chrono = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -43,5 +44,3 @@ opt-level = 3
 panic = "abort"
 strip = true
 
-[dev-dependencies]
-lopdf = "0.46"

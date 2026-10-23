@@ -13,6 +13,7 @@ type OutputPanelProps = {
   output: OutputInfo | null;
   isChoosing: boolean;
   isConverting: boolean;
+  isMerge: boolean;
   result: ConversionResult | null;
   error: string | null;
   resultError: string | null;
@@ -31,6 +32,7 @@ export function OutputPanel({
   output,
   isChoosing,
   isConverting,
+  isMerge,
   result,
   error,
   resultError,
@@ -134,15 +136,19 @@ export function OutputPanel({
                 <span className="text-white/85">PDF</span>
               </div>
               <div className="mt-1 flex items-center justify-between text-[11px]">
-                <span className="text-white/45">Images</span>
+                <span className="text-white/45">
+                  {isMerge ? "PDFs" : "Images"}
+                </span>
                 <span className="text-white/85">
                   {formatFileCount(selection.files.length)}
                 </span>
               </div>
               <div className="mt-1 flex items-center justify-between text-[11px]">
-                <span className="text-white/45">Layout</span>
+                <span className="text-white/45">
+                  {isMerge ? "Order" : "Layout"}
+                </span>
                 <span className="text-white/85">
-                  A4 portrait · fit with margins
+                  {isMerge ? "Preserved" : "A4 portrait · fit with margins"}
                 </span>
               </div>
             </div>
@@ -179,7 +185,7 @@ export function OutputPanel({
             {isConverting && (
               <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-[11px] text-white/60">
                 <span className="conversion-spinner" />
-                Creating PDF…
+                {isMerge ? "Merging PDFs…" : "Creating PDF…"}
               </div>
             )}
 
@@ -203,10 +209,16 @@ export function OutputPanel({
               onClick={onConvert}
             >
               {isConverting
-                ? "Creating PDF…"
+                ? isMerge
+                  ? "Merging PDFs…"
+                  : "Creating PDF…"
                 : error
-                  ? "Retry conversion"
-                  : "Convert to PDF"}
+                  ? isMerge
+                    ? "Retry merge"
+                    : "Retry conversion"
+                  : isMerge
+                    ? "Merge PDFs"
+                    : "Convert to PDF"}
             </button>
           </>
         )}

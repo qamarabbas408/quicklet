@@ -16,6 +16,8 @@ type FileConfirmationProps = {
   actionLabel: string;
   categoryIcon?: ComponentType<{ className?: string }>;
   mode: FileConfirmationMode;
+  minFiles: number;
+  fileNoun: string;
   isPicking: boolean;
   isDropMode: boolean;
   isDragActive: boolean;
@@ -38,6 +40,8 @@ export function FileConfirmation({
   actionLabel,
   categoryIcon,
   mode,
+  minFiles,
+  fileNoun,
   isPicking,
   isDropMode,
   isDragActive,
@@ -61,6 +65,11 @@ export function FileConfirmation({
   const hasKnownSize = files.some((file) => file.size !== null);
   const atLimit = files.length >= selection.limit;
   const isReview = mode === "review";
+  const enoughFiles = files.length >= minFiles;
+  const readyLabel =
+    files.length < minFiles && minFiles > 1
+      ? `Add at least ${minFiles} ${fileNoun} to continue.`
+      : `${formatFileCount(files.length)} ready`;
 
   const moveFile = (index: number, delta: number) => {
     const target = index + delta;
@@ -138,7 +147,7 @@ export function FileConfirmation({
           <div className="rounded-xl border border-dashed border-white/15 bg-white/[0.02] px-4 py-6 text-center">
             <p className="text-xs text-white/60">No files selected</p>
             <p className="mt-1 text-[10px] text-white/35">
-              Choose images or drop them here.
+              Choose {fileNoun} or drop them here.
             </p>
           </div>
         ) : (
@@ -229,9 +238,7 @@ export function FileConfirmation({
         )}
 
         <p className="text-[10px] text-emerald-300/70">
-          {isReview
-            ? "Drag rows or use the arrows to reorder."
-            : `${formatFileCount(files.length)} ready`}
+          {isReview ? "Drag rows or use the arrows to reorder." : readyLabel}
         </p>
 
         {selection.duplicates > 0 && (
@@ -311,7 +318,7 @@ export function FileConfirmation({
         <button
           type="button"
           className="w-full rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 disabled:cursor-not-allowed disabled:opacity-40"
-          disabled={files.length === 0 || isPicking}
+          disabled={!enoughFiles || isPicking}
           onClick={onContinue}
         >
           {isReview ? "Choose output" : "Review order"}

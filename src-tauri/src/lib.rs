@@ -1,3 +1,4 @@
+pub mod merge;
 pub mod pdf;
 
 use std::collections::HashMap;
@@ -505,6 +506,96 @@ async fn convert_to_pdf(app: AppHandle) -> Result<ConversionResult, String> {
     })
 }
 
+#[tauri::command]
+async fn merge_pdfs(app: AppHandle) -> Result<ConversionResult, String> {
+    let (paths, output) = {
+        let state = app.state::<InputState>();
+        ensure_not_converting(&state)?;
+
+        let action_id = state
+            .action_id
+            .lock()
+            .map(|action_id| action_id.clone())
+            .unwrap_or(None)
+            .ok_or_else(|| "Choose an action first.".to_string())?;
+
+        if action_id != "pdf.merge" {
+            return Err("This action is not available yet.".to_string());
+        }
+
+        let files = state
+            .files
+            .lock()
+            .map(|files| files.clone())
+            .unwrap_or_default();
+
+        if files.len() < 2 {
+            return Err("Select at least two PDF files to merge.".to_string());
+        }
+
+        let output = state
+            .output_path
+            .lock()
+            .map(|output| output.clone())
+            .unwrap_or(None)
+            .ok_or_else(|| "Choose an output destination first.".to_string())?;
+
+        if state
+            .conversion_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("A conversion is already running.".to_string());
+        }
+
+        (
+            files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>(),
+            output,
+        )
+    };
+
+    let guard_app = app.clone();
+    let task_output = output.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ConversionBusyGuard { app: guard_app };
+        merge::merge_pdfs_with_overwrite(&paths, &task_output)
+    })
+    .await;
+
+    let outcome = match joined {
+        Ok(result) => result.map_err(|error| error.to_string())?,
+        Err(error) => {
+            app.state::<InputState>()
+                .conversion_in_progress
+                .store(false, Ordering::SeqCst);
+            return Err(error.to_string());
+        }
+    };
+
+    if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
+        *last_output = Some(output.clone());
+    }
+
+    let name = output
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output.pdf".to_string());
+    let directory = output
+        .parent()
+        .map(|directory| directory.display().to_string())
+        .unwrap_or_default();
+
+    Ok(ConversionResult {
+        pages: outcome.pages,
+        bytes_written: outcome.bytes_written,
+        name,
+        directory,
+    })
+}
+
 fn last_output_path(state: &InputState) -> Result<PathBuf, String> {
     state
         .last_output
@@ -809,6 +900,7 @@ fn clear_input_state(state: &InputState) {
 fn action_input_kind(action_id: &str) -> Option<&'static str> {
     match action_id {
         "images.convert_to_pdf" => Some("images"),
+        "pdf.merge" => Some("pdf"),
         _ => None,
     }
 }
@@ -871,7 +963,7 @@ fn category_actions(category_id: &str) -> Vec<ActionInfo> {
             ),
         ],
         "pdf" => vec![
-            action("pdf.merge", "Merge PDFs", "Combine PDF documents", false, Some("pdf")),
+            action("pdf.merge", "Merge PDFs", "Combine PDF files into one document", true, Some("pdf")),
             action("pdf.split", "Split", "Split a PDF into pages", false, Some("pdf")),
             action("pdf.compress", "Compress", "Reduce PDF file size", false, Some("pdf")),
             action("pdf.extract_pages", "Extract pages", "Save selected pages", false, Some("pdf")),
@@ -1271,6 +1363,7 @@ pub fn run() {
             reorder_input,
             choose_output,
             convert_to_pdf,
+            merge_pdfs,
             reveal_output,
             open_output
         ])
@@ -1363,7 +1456,12 @@ mod tests {
         assert!(images_extensions.contains(&"png"));
         assert!(images_extensions.contains(&"webp"));
 
-        assert!(super::filter_for_action("pdf.merge").is_none());
+        let (pdf_name, pdf_extensions) =
+            super::filter_for_action("pdf.merge").expect("PDF merge should have filters");
+        assert_eq!(pdf_name, "PDF documents");
+        assert_eq!(pdf_extensions, &["pdf"]);
+
+        assert!(super::filter_for_action("pdf.split").is_none());
         assert!(super::filter_for_action("compress.files").is_none());
         assert!(super::filter_for_action("settings.preferences").is_none());
     }
@@ -1450,6 +1548,10 @@ mod tests {
         assert!(actions.iter().any(|action| !action.enabled));
         assert!(super::find_action("images.convert_to_pdf").is_some());
         assert!(super::find_action("images.convert_format").is_some());
+
+        let pdf_actions = super::category_actions("pdf");
+        assert!(pdf_actions.iter().any(|action| action.id == "pdf.merge" && action.enabled));
+        assert!(pdf_actions.iter().any(|action| action.id == "pdf.split" && !action.enabled));
     }
 
     #[test]

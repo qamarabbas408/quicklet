@@ -313,7 +313,11 @@ export function MenuWindow() {
     setResultActionError(null);
 
     try {
-      const result = await invoke<ConversionResult>("convert_to_pdf");
+      const command =
+        selectedOperation?.id === "pdf.merge"
+          ? "merge_pdfs"
+          : "convert_to_pdf";
+      const result = await invoke<ConversionResult>(command);
       setConversionResult(result);
     } catch (error) {
       setConversionError(String(error));
@@ -408,6 +412,8 @@ export function MenuWindow() {
           actionLabel={selectedOperation.label}
           categoryIcon={selectedAction?.icon}
           mode="input"
+          minFiles={selectedOperation.id === "pdf.merge" ? 2 : 1}
+          fileNoun={selectedOperation.id === "pdf.merge" ? "PDFs" : "images"}
           isPicking={isPicking}
           isDropMode={isDropMode}
           isDragActive={isDragActive}
@@ -430,6 +436,8 @@ export function MenuWindow() {
           actionLabel={selectedOperation.label}
           categoryIcon={selectedAction?.icon}
           mode="review"
+          minFiles={selectedOperation.id === "pdf.merge" ? 2 : 1}
+          fileNoun={selectedOperation.id === "pdf.merge" ? "PDFs" : "images"}
           isPicking={isPicking}
           isDropMode={false}
           isDragActive={false}
@@ -454,6 +462,7 @@ export function MenuWindow() {
           output={outputInfo}
           isChoosing={isChoosingOutput}
           isConverting={isConverting}
+          isMerge={selectedOperation.id === "pdf.merge"}
           result={conversionResult}
           error={conversionError ?? outputError}
           resultError={resultActionError}
