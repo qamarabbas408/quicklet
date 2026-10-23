@@ -1,17 +1,18 @@
 pub mod merge;
 pub mod pdf;
+pub mod split;
 
-use std::collections::HashMap;
 use chrono::Local;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
-use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_opener::OpenerExt;
 
 const MENU_WINDOW_LABEL: &str = "main";
 const DEFAULT_MENU_SIZE: f64 = 440.0;
@@ -54,10 +55,20 @@ struct InputState {
     action_id: Mutex<Option<String>>,
     files: Mutex<Vec<InputFile>>,
     output_path: Mutex<Option<PathBuf>>,
+    split_output_dir: Mutex<Option<PathBuf>>,
     last_output: Mutex<Option<PathBuf>>,
+    last_output_directory: Mutex<Option<PathBuf>>,
     dialog_open: AtomicBool,
     drop_mode: AtomicBool,
     conversion_in_progress: AtomicBool,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversionFile {
+    name: String,
+    pages: usize,
+    bytes_written: u64,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -67,6 +78,8 @@ struct ConversionResult {
     bytes_written: u64,
     name: String,
     directory: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<Vec<ConversionFile>>,
 }
 
 struct ConversionBusyGuard {
@@ -105,6 +118,23 @@ struct ActionInfo {
 struct OutputInfo {
     name: String,
     directory: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutputDirectoryInfo {
+    directory: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SplitSourceInfo {
+    name: String,
+    pages: usize,
+    bytes: u64,
+    max_pages: usize,
+    max_outputs: usize,
+    max_input_bytes: u64,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -215,9 +245,11 @@ async fn pick_input_files(
             .lock()
             .map(|files| files.len())
             .unwrap_or(0);
-        if current_count >= MAX_INPUT_FILES {
+        let limit = max_files_for_action(&action_id);
+        if current_count >= limit {
             return Err(format!(
-                "Maximum of {MAX_INPUT_FILES} files reached. Remove a file first."
+                "Maximum of {limit} {} reached. Remove a file first.",
+                if limit == 1 { "file" } else { "files" }
             ));
         }
     }
@@ -241,7 +273,8 @@ async fn pick_input_files(
         let _ = sender.send(paths);
     });
 
-    let received = tauri::async_runtime::spawn_blocking(move || receiver.recv().ok().flatten()).await;
+    let received =
+        tauri::async_runtime::spawn_blocking(move || receiver.recv().ok().flatten()).await;
 
     app.state::<InputState>()
         .dialog_open
@@ -386,7 +419,8 @@ async fn choose_output(
         let _ = sender.send(path);
     });
 
-    let received = tauri::async_runtime::spawn_blocking(move || receiver.recv().ok().flatten()).await;
+    let received =
+        tauri::async_runtime::spawn_blocking(move || receiver.recv().ok().flatten()).await;
 
     state.dialog_open.store(false, Ordering::SeqCst);
     note_menu_shown(&app);
@@ -409,8 +443,14 @@ async fn choose_output(
     if let Ok(mut output_path) = state.output_path.lock() {
         *output_path = Some(path);
     }
+    if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
+        *split_output_dir = None;
+    }
     if let Ok(mut last_output) = state.last_output.lock() {
         *last_output = None;
+    }
+    if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
+        *last_output_directory = None;
     }
 
     Ok(Some(OutputInfo { name, directory }))
@@ -488,6 +528,9 @@ async fn convert_to_pdf(app: AppHandle) -> Result<ConversionResult, String> {
     if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
         *last_output = Some(output.clone());
     }
+    if let Ok(mut last_output_directory) = app.state::<InputState>().last_output_directory.lock() {
+        *last_output_directory = None;
+    }
 
     let name = output
         .file_name()
@@ -503,6 +546,7 @@ async fn convert_to_pdf(app: AppHandle) -> Result<ConversionResult, String> {
         bytes_written: outcome.bytes_written,
         name,
         directory,
+        files: None,
     })
 }
 
@@ -578,6 +622,9 @@ async fn merge_pdfs(app: AppHandle) -> Result<ConversionResult, String> {
     if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
         *last_output = Some(output.clone());
     }
+    if let Ok(mut last_output_directory) = app.state::<InputState>().last_output_directory.lock() {
+        *last_output_directory = None;
+    }
 
     let name = output
         .file_name()
@@ -593,7 +640,234 @@ async fn merge_pdfs(app: AppHandle) -> Result<ConversionResult, String> {
         bytes_written: outcome.bytes_written,
         name,
         directory,
+        files: None,
     })
+}
+
+#[tauri::command]
+async fn inspect_split_source(app: AppHandle) -> Result<SplitSourceInfo, String> {
+    let path = split_input_path(&app)?;
+    let task_path = path.clone();
+
+    let info = tauri::async_runtime::spawn_blocking(move || split::inspect_pdf(&task_path))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document.pdf".to_string());
+
+    Ok(SplitSourceInfo {
+        name,
+        pages: info.pages,
+        bytes: info.bytes,
+        max_pages: split::MAX_SPLIT_PAGES,
+        max_outputs: split::MAX_SPLIT_OUTPUTS,
+        max_input_bytes: split::MAX_SPLIT_INPUT_BYTES,
+    })
+}
+
+#[tauri::command]
+fn plan_split(
+    app: AppHandle,
+    page_count: usize,
+    mode: String,
+    ranges: String,
+) -> Result<split::SplitPlan, String> {
+    let path = split_input_path(&app)?;
+    let mode =
+        split::SplitMode::parse(&mode).ok_or_else(|| "Choose a valid split mode.".to_string())?;
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Document".to_string());
+
+    split::plan_split(page_count, &stem, mode, &ranges).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn choose_output_directory(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<Option<OutputDirectoryInfo>, String> {
+    split_input_path(&app)?;
+    let state = app.state::<InputState>();
+    ensure_not_converting(&state)?;
+
+    state.dialog_open.store(true, Ordering::SeqCst);
+
+    let dialog = app
+        .dialog()
+        .file()
+        .set_title("Choose output folder")
+        .set_parent(&window);
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    dialog.pick_folder(move |path| {
+        let _ = sender.send(path);
+    });
+
+    let received =
+        tauri::async_runtime::spawn_blocking(move || receiver.recv().ok().flatten()).await;
+
+    state.dialog_open.store(false, Ordering::SeqCst);
+    note_menu_shown(&app);
+
+    let picked = received.map_err(|error| error.to_string())?;
+    let Some(folder) = picked else {
+        return Ok(None);
+    };
+
+    let path = folder.into_path().map_err(|error| error.to_string())?;
+    if !path.is_dir() {
+        return Err("Choose an existing folder.".to_string());
+    }
+
+    if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
+        *split_output_dir = Some(path.clone());
+    }
+    if let Ok(mut output_path) = state.output_path.lock() {
+        *output_path = None;
+    }
+    if let Ok(mut last_output) = state.last_output.lock() {
+        *last_output = None;
+    }
+    if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
+        *last_output_directory = None;
+    }
+
+    Ok(Some(OutputDirectoryInfo {
+        directory: path.display().to_string(),
+    }))
+}
+
+#[tauri::command]
+async fn split_pdf(
+    app: AppHandle,
+    mode: String,
+    ranges: String,
+) -> Result<ConversionResult, String> {
+    let (path, output_directory) = {
+        let state = app.state::<InputState>();
+        ensure_not_converting(&state)?;
+
+        let action_id = state
+            .action_id
+            .lock()
+            .map(|action_id| action_id.clone())
+            .unwrap_or(None)
+            .ok_or_else(|| "Choose an action first.".to_string())?;
+
+        if action_id != "pdf.split" {
+            return Err("This action is not available yet.".to_string());
+        }
+
+        let files = state
+            .files
+            .lock()
+            .map(|files| files.clone())
+            .unwrap_or_default();
+
+        if files.len() != 1 {
+            return Err("Select exactly one PDF to split.".to_string());
+        }
+
+        let output_directory = state
+            .split_output_dir
+            .lock()
+            .map(|directory| directory.clone())
+            .unwrap_or(None)
+            .ok_or_else(|| "Choose an output folder first.".to_string())?;
+
+        if state
+            .conversion_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("A conversion is already running.".to_string());
+        }
+
+        (files[0].path.clone(), output_directory)
+    };
+
+    let mode =
+        split::SplitMode::parse(&mode).ok_or_else(|| "Choose a valid split mode.".to_string())?;
+
+    let guard_app = app.clone();
+    let task_directory = output_directory.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ConversionBusyGuard { app: guard_app };
+        split::split_pdf(&path, &task_directory, mode, &ranges)
+    })
+    .await;
+
+    let outcome = match joined {
+        Ok(result) => result.map_err(|error| error.to_string())?,
+        Err(error) => {
+            app.state::<InputState>()
+                .conversion_in_progress
+                .store(false, Ordering::SeqCst);
+            return Err(error.to_string());
+        }
+    };
+
+    let Some(first_file) = outcome.files.first() else {
+        return Err("No output files were created.".to_string());
+    };
+    let first_output = output_directory.join(&first_file.name);
+    if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
+        *last_output = Some(first_output);
+    }
+    if let Ok(mut last_output_directory) = app.state::<InputState>().last_output_directory.lock() {
+        *last_output_directory = Some(output_directory.clone());
+    }
+
+    let files = outcome
+        .files
+        .into_iter()
+        .map(|file| ConversionFile {
+            name: file.name,
+            pages: file.pages,
+            bytes_written: file.bytes_written,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(ConversionResult {
+        pages: outcome.pages,
+        bytes_written: outcome.bytes_written,
+        name: format!(
+            "{} {}",
+            files.len(),
+            if files.len() == 1 { "PDF" } else { "PDFs" }
+        ),
+        directory: output_directory.display().to_string(),
+        files: Some(files),
+    })
+}
+
+#[tauri::command]
+fn open_output_directory(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<InputState>();
+    let directory = state
+        .last_output_directory
+        .lock()
+        .map(|directory| directory.clone())
+        .unwrap_or(None)
+        .or_else(|| {
+            state
+                .last_output
+                .lock()
+                .ok()
+                .and_then(|path| path.clone())
+                .and_then(|path| path.parent().map(PathBuf::from))
+        })
+        .ok_or_else(|| "No split output yet.".to_string())?;
+
+    app.opener()
+        .open_path(directory.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|error| error.to_string())
 }
 
 fn last_output_path(state: &InputState) -> Result<PathBuf, String> {
@@ -653,10 +927,11 @@ fn ingest_paths(
     } else {
         Vec::new()
     };
+    let limit = max_files_for_action(action_id);
     let capacity = if append {
-        MAX_INPUT_FILES.saturating_sub(existing.len())
+        limit.saturating_sub(existing.len())
     } else {
-        MAX_INPUT_FILES
+        limit
     };
 
     let mut next_id = state.next_id.lock().map(|id| *id).unwrap_or(0);
@@ -735,8 +1010,14 @@ fn ingest_paths(
         if let Ok(mut output_path) = state.output_path.lock() {
             *output_path = None;
         }
+        if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
+            *split_output_dir = None;
+        }
         if let Ok(mut last_output) = state.last_output.lock() {
             *last_output = None;
+        }
+        if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
+            *last_output_directory = None;
         }
     }
 
@@ -745,7 +1026,10 @@ fn ingest_paths(
     selection.limit_skipped = limit_skipped;
     selection.rejected = rejected;
 
-    IngestOutcome { selection, accepted }
+    IngestOutcome {
+        selection,
+        accepted,
+    }
 }
 
 fn extension_is_allowed(action_id: &str, extension: Option<&str>) -> bool {
@@ -830,8 +1114,14 @@ fn remove_input_file(app: AppHandle, id: u64) -> Result<InputSelection, String> 
     if let Ok(mut output_path) = state.output_path.lock() {
         *output_path = None;
     }
+    if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
+        *split_output_dir = None;
+    }
     if let Ok(mut last_output) = state.last_output.lock() {
         *last_output = None;
+    }
+    if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
+        *last_output_directory = None;
     }
 
     Ok(input_snapshot(&state))
@@ -848,8 +1138,14 @@ fn clear_input(app: AppHandle) -> Result<(), String> {
     if let Ok(mut output_path) = state.output_path.lock() {
         *output_path = None;
     }
+    if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
+        *split_output_dir = None;
+    }
     if let Ok(mut last_output) = state.last_output.lock() {
         *last_output = None;
+    }
+    if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
+        *last_output_directory = None;
     }
 
     Ok(())
@@ -868,10 +1164,11 @@ fn input_snapshot(state: &InputState) -> InputSelection {
         .map(|files| files.clone())
         .unwrap_or_default();
 
+    let limit = max_files_for_action(&action_id);
     InputSelection {
         action_id,
         files,
-        limit: MAX_INPUT_FILES,
+        limit,
         duplicates: 0,
         limit_skipped: 0,
         rejected: 0,
@@ -892,15 +1189,57 @@ fn clear_input_state(state: &InputState) {
     if let Ok(mut output_path) = state.output_path.lock() {
         *output_path = None;
     }
+    if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
+        *split_output_dir = None;
+    }
     if let Ok(mut last_output) = state.last_output.lock() {
         *last_output = None;
+    }
+    if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
+        *last_output_directory = None;
+    }
+}
+
+fn split_input_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let state = app.state::<InputState>();
+    ensure_not_converting(&state)?;
+
+    let action_id = state
+        .action_id
+        .lock()
+        .map(|action_id| action_id.clone())
+        .unwrap_or(None)
+        .ok_or_else(|| "Choose an action first.".to_string())?;
+
+    if action_id != "pdf.split" {
+        return Err("This action is not available yet.".to_string());
+    }
+
+    let files = state
+        .files
+        .lock()
+        .map(|files| files.clone())
+        .unwrap_or_default();
+
+    if files.len() != 1 {
+        return Err("Select exactly one PDF to split.".to_string());
+    }
+
+    Ok(files[0].path.clone())
+}
+
+fn max_files_for_action(action_id: &str) -> usize {
+    if action_id == "pdf.split" {
+        1
+    } else {
+        MAX_INPUT_FILES
     }
 }
 
 fn action_input_kind(action_id: &str) -> Option<&'static str> {
     match action_id {
         "images.convert_to_pdf" => Some("images"),
-        "pdf.merge" => Some("pdf"),
+        "pdf.merge" | "pdf.split" => Some("pdf"),
         _ => None,
     }
 }
@@ -921,15 +1260,14 @@ fn filter_for_action(action_id: &str) -> Option<(&'static str, &'static [&'stati
 }
 
 fn category_actions(category_id: &str) -> Vec<ActionInfo> {
-    let action = |id: &str, label: &str, description: &str, enabled: bool, input: Option<&str>| {
-        ActionInfo {
+    let action =
+        |id: &str, label: &str, description: &str, enabled: bool, input: Option<&str>| ActionInfo {
             id: id.to_string(),
             label: label.to_string(),
             description: description.to_string(),
             enabled,
             input: input.map(str::to_string),
-        }
-    };
+        };
 
     match category_id {
         "images" => vec![
@@ -963,39 +1301,112 @@ fn category_actions(category_id: &str) -> Vec<ActionInfo> {
             ),
         ],
         "pdf" => vec![
-            action("pdf.merge", "Merge PDFs", "Combine PDF files into one document", true, Some("pdf")),
-            action("pdf.split", "Split", "Split a PDF into pages", false, Some("pdf")),
-            action("pdf.compress", "Compress", "Reduce PDF file size", false, Some("pdf")),
-            action("pdf.extract_pages", "Extract pages", "Save selected pages", false, Some("pdf")),
+            action(
+                "pdf.merge",
+                "Merge PDFs",
+                "Combine PDF files into one document",
+                true,
+                Some("pdf"),
+            ),
+            action(
+                "pdf.split",
+                "Split PDF",
+                "Split into separate PDFs or custom ranges",
+                true,
+                Some("pdf"),
+            ),
+            action(
+                "pdf.compress",
+                "Compress",
+                "Reduce PDF file size",
+                false,
+                Some("pdf"),
+            ),
+            action(
+                "pdf.extract_pages",
+                "Extract pages",
+                "Save selected pages",
+                false,
+                Some("pdf"),
+            ),
         ],
         "compress" => vec![
-            action("compress.files", "Compress files", "Reduce file size", false, None),
-            action("compress.extract", "Extract archive", "Unpack an archive", false, None),
+            action(
+                "compress.files",
+                "Compress files",
+                "Reduce file size",
+                false,
+                None,
+            ),
+            action(
+                "compress.extract",
+                "Extract archive",
+                "Unpack an archive",
+                false,
+                None,
+            ),
         ],
         "documents" => vec![
-            action("documents.convert", "Convert format", "Convert document formats", false, None),
-            action("documents.extract_text", "Extract text", "Save text from a document", false, None),
+            action(
+                "documents.convert",
+                "Convert format",
+                "Convert document formats",
+                false,
+                None,
+            ),
+            action(
+                "documents.extract_text",
+                "Extract text",
+                "Save text from a document",
+                false,
+                None,
+            ),
         ],
-        "tools" => vec![
-            action("tools.utilities", "Quick utilities", "More tools coming soon", false, None),
-        ],
+        "tools" => vec![action(
+            "tools.utilities",
+            "Quick utilities",
+            "More tools coming soon",
+            false,
+            None,
+        )],
         "settings" => vec![
-            action("settings.preferences", "Preferences", "Appearance and behavior", false, None),
-            action("settings.shortcuts", "Shortcuts", "Change the global shortcut", false, None),
+            action(
+                "settings.preferences",
+                "Preferences",
+                "Appearance and behavior",
+                false,
+                None,
+            ),
+            action(
+                "settings.shortcuts",
+                "Shortcuts",
+                "Change the global shortcut",
+                false,
+                None,
+            ),
         ],
         _ => Vec::new(),
     }
 }
 
 fn all_actions() -> Vec<ActionInfo> {
-    ["images", "pdf", "compress", "documents", "tools", "settings"]
-        .into_iter()
-        .flat_map(category_actions)
-        .collect()
+    [
+        "images",
+        "pdf",
+        "compress",
+        "documents",
+        "tools",
+        "settings",
+    ]
+    .into_iter()
+    .flat_map(category_actions)
+    .collect()
 }
 
 fn find_action(action_id: &str) -> Option<ActionInfo> {
-    all_actions().into_iter().find(|action| action.id == action_id)
+    all_actions()
+        .into_iter()
+        .find(|action| action.id == action_id)
 }
 
 fn describe_kind(extension: Option<&str>) -> String {
@@ -1133,10 +1544,8 @@ fn compute_menu_position(
 
     let min_x = area_position.0 + margin;
     let min_y = area_position.1 + margin;
-    let max_x =
-        (area_position.0 + area_size.0 as i32 - window_size.0 as i32 - margin).max(min_x);
-    let max_y =
-        (area_position.1 + area_size.1 as i32 - window_size.1 as i32 - margin).max(min_y);
+    let max_x = (area_position.0 + area_size.0 as i32 - window_size.0 as i32 - margin).max(min_x);
+    let max_y = (area_position.1 + area_size.1 as i32 - window_size.1 as i32 - margin).max(min_y);
 
     (target_x.clamp(min_x, max_x), target_y.clamp(min_y, max_y))
 }
@@ -1312,15 +1721,11 @@ fn setup_menu_window(app: &tauri::App) -> tauri::Result<()> {
 fn create_dev_launcher(app: &tauri::App) -> tauri::Result<()> {
     use tauri::{WebviewUrl, WebviewWindowBuilder};
 
-    WebviewWindowBuilder::new(
-        app,
-        "dev-launcher",
-        WebviewUrl::App("index.html".into()),
-    )
-    .title("Quicklet Dev")
-    .inner_size(360.0, 330.0)
-    .resizable(false)
-    .build()?;
+    WebviewWindowBuilder::new(app, "dev-launcher", WebviewUrl::App("index.html".into()))
+        .title("Quicklet Dev")
+        .inner_size(360.0, 330.0)
+        .resizable(false)
+        .build()?;
 
     Ok(())
 }
@@ -1362,10 +1767,15 @@ pub fn run() {
             get_input,
             reorder_input,
             choose_output,
+            choose_output_directory,
             convert_to_pdf,
             merge_pdfs,
+            inspect_split_source,
+            plan_split,
+            split_pdf,
             reveal_output,
-            open_output
+            open_output,
+            open_output_directory
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]
@@ -1384,10 +1794,9 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::{compute_menu_position, ensure_not_converting, InputState};
+    use super::{InputState, compute_menu_position, ensure_not_converting};
     use std::sync::atomic::Ordering;
 
     const WINDOW: (u32, u32) = (440, 440);
@@ -1395,55 +1804,38 @@ mod tests {
 
     #[test]
     fn centers_on_cursor_when_space_is_available() {
-        let position = compute_menu_position(
-            (1920.0, 1080.0),
-            WINDOW,
-            (0, 0),
-            (3840, 2160),
-            MARGIN,
-        );
+        let position =
+            compute_menu_position((1920.0, 1080.0), WINDOW, (0, 0), (3840, 2160), MARGIN);
 
         assert_eq!(position, (1700, 860));
     }
 
     #[test]
     fn clamps_near_top_left_work_area_edge() {
-        let position =
-            compute_menu_position((20.0, 20.0), WINDOW, (0, 0), (1920, 1080), MARGIN);
+        let position = compute_menu_position((20.0, 20.0), WINDOW, (0, 0), (1920, 1080), MARGIN);
 
         assert_eq!(position, (8, 8));
     }
 
     #[test]
     fn clamps_near_bottom_right_work_area_edge() {
-        let position = compute_menu_position(
-            (1910.0, 1070.0),
-            WINDOW,
-            (0, 0),
-            (1920, 1080),
-            MARGIN,
-        );
+        let position =
+            compute_menu_position((1910.0, 1070.0), WINDOW, (0, 0), (1920, 1080), MARGIN);
 
         assert_eq!(position, (1472, 632));
     }
 
     #[test]
     fn supports_negative_coordinates_on_secondary_monitors() {
-        let position = compute_menu_position(
-            (-960.0, 540.0),
-            WINDOW,
-            (-1920, 0),
-            (1920, 1080),
-            MARGIN,
-        );
+        let position =
+            compute_menu_position((-960.0, 540.0), WINDOW, (-1920, 0), (1920, 1080), MARGIN);
 
         assert_eq!(position, (-1180, 320));
     }
 
     #[test]
     fn clamps_to_work_area_origin_when_area_is_smaller_than_window() {
-        let position =
-            compute_menu_position((100.0, 100.0), WINDOW, (0, 0), (300, 300), MARGIN);
+        let position = compute_menu_position((100.0, 100.0), WINDOW, (0, 0), (300, 300), MARGIN);
 
         assert_eq!(position, (8, 8));
     }
@@ -1461,7 +1853,11 @@ mod tests {
         assert_eq!(pdf_name, "PDF documents");
         assert_eq!(pdf_extensions, &["pdf"]);
 
-        assert!(super::filter_for_action("pdf.split").is_none());
+        let (split_name, split_extensions) =
+            super::filter_for_action("pdf.split").expect("PDF split should have filters");
+        assert_eq!(split_name, "PDF documents");
+        assert_eq!(split_extensions, &["pdf"]);
+
         assert!(super::filter_for_action("compress.files").is_none());
         assert!(super::filter_for_action("settings.preferences").is_none());
     }
@@ -1490,8 +1886,14 @@ mod tests {
 
     #[test]
     fn enforces_extension_filters_for_actions() {
-        assert!(super::extension_is_allowed("images.convert_to_pdf", Some("png")));
-        assert!(!super::extension_is_allowed("images.convert_to_pdf", Some("pdf")));
+        assert!(super::extension_is_allowed(
+            "images.convert_to_pdf",
+            Some("png")
+        ));
+        assert!(!super::extension_is_allowed(
+            "images.convert_to_pdf",
+            Some("pdf")
+        ));
         assert!(!super::extension_is_allowed("images.convert_to_pdf", None));
         assert!(super::filter_for_action("compress.files").is_none());
     }
@@ -1550,8 +1952,35 @@ mod tests {
         assert!(super::find_action("images.convert_format").is_some());
 
         let pdf_actions = super::category_actions("pdf");
-        assert!(pdf_actions.iter().any(|action| action.id == "pdf.merge" && action.enabled));
-        assert!(pdf_actions.iter().any(|action| action.id == "pdf.split" && !action.enabled));
+        assert!(
+            pdf_actions
+                .iter()
+                .any(|action| action.id == "pdf.merge" && action.enabled)
+        );
+        assert!(
+            pdf_actions
+                .iter()
+                .any(|action| action.id == "pdf.split" && action.enabled)
+        );
+    }
+
+    #[test]
+    fn split_ingestion_allows_only_one_pdf() {
+        let dir = test_dir("split-limit");
+        let first = dir.join("first.pdf");
+        let second = dir.join("second.pdf");
+        std::fs::write(&first, b"x").expect("first PDF should be written");
+        std::fs::write(&second, b"x").expect("second PDF should be written");
+
+        let state = super::InputState::default();
+        let outcome = super::ingest_paths(&state, "pdf.split", vec![first, second], false);
+
+        assert_eq!(outcome.accepted, 1);
+        assert_eq!(outcome.selection.files.len(), 1);
+        assert_eq!(outcome.selection.limit, 1);
+        assert_eq!(outcome.selection.limit_skipped, 1);
+
+        std::fs::remove_dir_all(dir).expect("test directory should be removed");
     }
 
     #[test]
@@ -1568,10 +1997,7 @@ mod tests {
 
     #[test]
     fn defaults_output_name_to_quicklet_date() {
-        let expected = format!(
-            "Quicklet-{}.pdf",
-            chrono::Local::now().format("%Y-%m-%d")
-        );
+        let expected = format!("Quicklet-{}.pdf", chrono::Local::now().format("%Y-%m-%d"));
 
         assert_eq!(super::default_output_name(), expected);
         assert!(super::default_output_name().starts_with("Quicklet-"));

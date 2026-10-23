@@ -18,6 +18,8 @@ type FileConfirmationProps = {
   mode: FileConfirmationMode;
   minFiles: number;
   fileNoun: string;
+  continueLabel?: string;
+  isContinuing?: boolean;
   isPicking: boolean;
   isDropMode: boolean;
   isDragActive: boolean;
@@ -42,6 +44,8 @@ export function FileConfirmation({
   mode,
   minFiles,
   fileNoun,
+  continueLabel,
+  isContinuing = false,
   isPicking,
   isDropMode,
   isDragActive,
@@ -129,7 +133,11 @@ export function FileConfirmation({
                 id="confirmation-title"
                 className="truncate text-sm font-semibold text-white"
               >
-                {isReview ? "Review order" : "Select files"}
+                {isReview
+                  ? "Review order"
+                  : selection.limit === 1
+                    ? "Select file"
+                    : "Select files"}
               </h2>
               <span className="shrink-0 text-[11px] text-white/40">
                 {actionLabel}
@@ -318,10 +326,14 @@ export function FileConfirmation({
         <button
           type="button"
           className="w-full rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 disabled:cursor-not-allowed disabled:opacity-40"
-          disabled={!enoughFiles || isPicking}
+          disabled={!enoughFiles || isPicking || isContinuing}
           onClick={onContinue}
         >
-          {isReview ? "Choose output" : "Review order"}
+          {isContinuing
+            ? "Inspecting PDF…"
+            : isReview
+              ? "Choose output"
+              : (continueLabel ?? "Review order")}
         </button>
 
         <div className="flex items-center justify-between text-[10px]">

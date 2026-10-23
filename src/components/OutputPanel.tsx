@@ -1,19 +1,26 @@
 import type {
   ConversionResult,
+  OutputDirectoryInfo,
   OutputInfo,
   RadialAction,
+  SplitMode,
+  SplitPlan,
 } from "../lib/actions";
 import type { InputSelection } from "../lib/input";
-import { formatBytes, formatFileCount } from "../lib/format";
+import { formatBytes, formatFileCount, formatPageRanges } from "../lib/format";
 
 type OutputPanelProps = {
   category: RadialAction | null;
   actionLabel: string;
   selection: InputSelection;
   output: OutputInfo | null;
+  outputDirectory: OutputDirectoryInfo | null;
   isChoosing: boolean;
   isConverting: boolean;
   isMerge: boolean;
+  isSplit: boolean;
+  splitMode: SplitMode;
+  splitPlan: SplitPlan | null;
   result: ConversionResult | null;
   error: string | null;
   resultError: string | null;
@@ -21,6 +28,7 @@ type OutputPanelProps = {
   onConvert: () => void;
   onReveal: () => void;
   onOpen: () => void;
+  onOpenFolder: () => void;
   onBack: () => void;
   onDismiss: () => void;
 };
@@ -30,9 +38,13 @@ export function OutputPanel({
   actionLabel,
   selection,
   output,
+  outputDirectory,
   isChoosing,
   isConverting,
   isMerge,
+  isSplit,
+  splitMode,
+  splitPlan,
   result,
   error,
   resultError,
@@ -40,6 +52,7 @@ export function OutputPanel({
   onConvert,
   onReveal,
   onOpen,
+  onOpenFolder,
   onBack,
   onDismiss,
 }: OutputPanelProps) {
@@ -47,7 +60,30 @@ export function OutputPanel({
   const revealLabel = /Mac/i.test(navigator.userAgent)
     ? "Reveal in Finder"
     : "Show in folder";
-  const canConvert = output !== null && !isChoosing && !isConverting;
+  const files = result?.files ?? [];
+  const hasFileList = files.length > 0;
+  const canConvert = isSplit
+    ? outputDirectory !== null && splitPlan !== null && !isChoosing && !isConverting
+    : output !== null && !isChoosing && !isConverting;
+  const splitExcluded = splitPlan?.excludedPages ?? [];
+  const splitIncluded = splitPlan
+    ? splitPlan.outputs.reduce((sum, item) => sum + item.pages.length, 0)
+    : 0;
+  const busyLabel = isSplit
+    ? "Splitting PDF…"
+    : isMerge
+      ? "Merging PDFs…"
+      : "Creating PDF…";
+  const actionLabelForButton = isSplit
+    ? "Split PDF"
+    : isMerge
+      ? "Merge PDFs"
+      : "Convert to PDF";
+  const retryLabel = isSplit
+    ? "Retry split"
+    : isMerge
+      ? "Retry merge"
+      : "Retry conversion";
 
   return (
     <div
@@ -83,7 +119,13 @@ export function OutputPanel({
               id="output-title"
               className="truncate text-sm font-semibold text-white"
             >
-              {result ? "PDF created" : "Output"}
+              {result
+                ? hasFileList
+                  ? files.length === 1
+                    ? "PDF created"
+                    : "PDFs created"
+                  : "PDF created"
+                : "Output"}
             </h2>
             <p className="mt-0.5 text-[11px] text-white/45">{actionLabel}</p>
           </div>
@@ -91,18 +133,54 @@ export function OutputPanel({
 
         {result ? (
           <>
-            <div className="rounded-xl border border-emerald-300/15 bg-emerald-300/[0.06] px-3 py-3">
-              <p className="text-xs font-medium text-emerald-200/90">
-                {result.name}
-              </p>
-              <p className="mt-1 truncate text-[10px] text-white/40">
-                {result.directory}
-              </p>
-              <p className="mt-2 text-[10px] text-white/45">
-                {result.pages} {result.pages === 1 ? "page" : "pages"} ·{" "}
-                {formatBytes(result.bytesWritten)}
-              </p>
-            </div>
+            {hasFileList ? (
+              <div className="rounded-xl border border-emerald-300/15 bg-emerald-300/[0.06] px-3 py-3">
+                <p className="text-xs font-medium text-emerald-200/90">
+                  {formatFileCount(files.length)}
+                </p>
+                <p className="mt-1 truncate text-[10px] text-white/40">
+                  {result.directory}
+                </p>
+                <p className="mt-2 text-[10px] text-white/45">
+                  {result.pages} {result.pages === 1 ? "page" : "pages"} ·{" "}
+                  {formatBytes(result.bytesWritten)}
+                </p>
+                <ul
+                  className="confirmation-list mt-2 max-h-28"
+                  aria-label="Created PDF files"
+                >
+                  {files.map((file) => (
+                    <li
+                      key={file.name}
+                      className="flex items-center justify-between gap-2 rounded-lg px-1.5 py-1 text-[10px]"
+                    >
+                      <span
+                        className="min-w-0 truncate text-white/75"
+                        title={file.name}
+                      >
+                        {file.name}
+                      </span>
+                      <span className="shrink-0 text-white/35">
+                        {file.pages}p · {formatBytes(file.bytesWritten)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <div className="rounded-xl border border-emerald-300/15 bg-emerald-300/[0.06] px-3 py-3">
+                <p className="text-xs font-medium text-emerald-200/90">
+                  {result.name}
+                </p>
+                <p className="mt-1 truncate text-[10px] text-white/40">
+                  {result.directory}
+                </p>
+                <p className="mt-2 text-[10px] text-white/45">
+                  {result.pages} {result.pages === 1 ? "page" : "pages"} ·{" "}
+                  {formatBytes(result.bytesWritten)}
+                </p>
+              </div>
+            )}
 
             {resultError && (
               <p
@@ -123,41 +201,96 @@ export function OutputPanel({
             <button
               type="button"
               className="w-full rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-white/70 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"
-              onClick={onOpen}
+              onClick={hasFileList ? onOpenFolder : onOpen}
             >
-              Open PDF
+              {hasFileList ? "Open folder" : "Open PDF"}
             </button>
           </>
         ) : (
           <>
-            <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
-              <div className="flex items-center justify-between text-[11px]">
-                <span className="text-white/45">Format</span>
-                <span className="text-white/85">PDF</span>
+            {isSplit ? (
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Format</span>
+                  <span className="text-white/85">PDF</span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Mode</span>
+                  <span className="text-white/85">
+                    {splitMode === "every" ? "Every page" : "Custom ranges"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Output files</span>
+                  <span className="text-white/85">
+                    {splitPlan ? formatFileCount(splitPlan.outputs.length) : "—"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Included pages</span>
+                  <span className="text-white/85">
+                    {splitPlan
+                      ? `${splitIncluded} of ${splitPlan.pageCount}`
+                      : "—"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-start justify-between gap-3 text-[11px]">
+                  <span className="shrink-0 text-white/45">Excluded</span>
+                  <span
+                    className={`text-right ${
+                      splitExcluded.length > 0
+                        ? "text-amber-200/85"
+                        : "text-emerald-300/80"
+                    }`}
+                  >
+                    {splitPlan
+                      ? splitExcluded.length > 0
+                        ? `Pages ${formatPageRanges(splitExcluded)}`
+                        : "All pages included"
+                      : "—"}
+                  </span>
+                </div>
               </div>
-              <div className="mt-1 flex items-center justify-between text-[11px]">
-                <span className="text-white/45">
-                  {isMerge ? "PDFs" : "Images"}
-                </span>
-                <span className="text-white/85">
-                  {formatFileCount(selection.files.length)}
-                </span>
+            ) : (
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Format</span>
+                  <span className="text-white/85">PDF</span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">
+                    {isMerge ? "PDFs" : "Images"}
+                  </span>
+                  <span className="text-white/85">
+                    {formatFileCount(selection.files.length)}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">
+                    {isMerge ? "Order" : "Layout"}
+                  </span>
+                  <span className="text-white/85">
+                    {isMerge ? "Preserved" : "A4 portrait · fit with margins"}
+                  </span>
+                </div>
               </div>
-              <div className="mt-1 flex items-center justify-between text-[11px]">
-                <span className="text-white/45">
-                  {isMerge ? "Order" : "Layout"}
-                </span>
-                <span className="text-white/85">
-                  {isMerge ? "Preserved" : "A4 portrait · fit with margins"}
-                </span>
-              </div>
-            </div>
+            )}
 
             <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
               <p className="text-[10px] uppercase tracking-wide text-white/35">
                 Save to
               </p>
-              {output ? (
+              {isSplit ? (
+                outputDirectory ? (
+                  <p className="mt-1 truncate text-[10px] text-white/60">
+                    {outputDirectory.directory}
+                  </p>
+                ) : (
+                  <p className="mt-1 text-xs text-white/45">
+                    No folder selected
+                  </p>
+                )
+              ) : output ? (
                 <>
                   <p className="mt-1 truncate text-xs font-medium text-white/85">
                     {output.name}
@@ -185,7 +318,7 @@ export function OutputPanel({
             {isConverting && (
               <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-[11px] text-white/60">
                 <span className="conversion-spinner" />
-                {isMerge ? "Merging PDFs…" : "Creating PDF…"}
+                {busyLabel}
               </div>
             )}
 
@@ -196,10 +329,14 @@ export function OutputPanel({
               onClick={onChooseOutput}
             >
               {isChoosing
-                ? "Choosing destination…"
-                : output
-                  ? "Change destination"
-                  : "Choose destination"}
+                ? "Choosing folder…"
+                : isSplit
+                  ? outputDirectory
+                    ? "Change output folder"
+                    : "Choose output folder"
+                  : output
+                    ? "Change destination"
+                    : "Choose destination"}
             </button>
 
             <button
@@ -209,16 +346,10 @@ export function OutputPanel({
               onClick={onConvert}
             >
               {isConverting
-                ? isMerge
-                  ? "Merging PDFs…"
-                  : "Creating PDF…"
+                ? busyLabel
                 : error
-                  ? isMerge
-                    ? "Retry merge"
-                    : "Retry conversion"
-                  : isMerge
-                    ? "Merge PDFs"
-                    : "Convert to PDF"}
+                  ? retryLabel
+                  : actionLabelForButton}
             </button>
           </>
         )}
@@ -230,7 +361,7 @@ export function OutputPanel({
             disabled={isConverting}
             onClick={onBack}
           >
-            &larr; Review files
+            &larr; {isSplit ? "Split settings" : "Review files"}
           </button>
           <span className="text-white/30">Esc to dismiss</span>
         </div>

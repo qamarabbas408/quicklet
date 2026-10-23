@@ -4,18 +4,23 @@ import { listen } from "@tauri-apps/api/event";
 import { ActionList } from "./ActionList";
 import { FileConfirmation } from "./FileConfirmation";
 import { OutputPanel } from "./OutputPanel";
+import { SplitSettings } from "./SplitSettings";
 import { QuickletMark } from "./icons";
 import { RadialMenu } from "./RadialMenu";
 import type {
   ActionInfo,
   ConversionResult,
+  OutputDirectoryInfo,
   OutputInfo,
   RadialAction,
+  SplitMode,
+  SplitPlan,
+  SplitSourceInfo,
 } from "../lib/actions";
 import { APP_NAME, IS_TAURI } from "../lib/constants";
 import type { InputSelection } from "../lib/input";
 
-type Stage = "radial" | "actions" | "input" | "review" | "output";
+type Stage = "radial" | "actions" | "input" | "review" | "configure" | "output";
 
 type DragState = {
   active: boolean;
@@ -47,6 +52,15 @@ export function MenuWindow() {
     null,
   );
   const [isPicking, setIsPicking] = useState(false);
+  const [isInspectingSplit, setIsInspectingSplit] = useState(false);
+  const [splitSource, setSplitSource] = useState<SplitSourceInfo | null>(null);
+  const [splitMode, setSplitMode] = useState<SplitMode>("every");
+  const [splitRanges, setSplitRanges] = useState("");
+  const [splitPlan, setSplitPlan] = useState<SplitPlan | null>(null);
+  const [splitPlanError, setSplitPlanError] = useState<string | null>(null);
+  const [isPlanning, setIsPlanning] = useState(false);
+  const [outputDirectory, setOutputDirectory] =
+    useState<OutputDirectoryInfo | null>(null);
   const [pickerError, setPickerError] = useState<string | null>(null);
   const [isDropMode, setIsDropMode] = useState(false);
   const [isDragActive, setIsDragActive] = useState(false);
@@ -69,6 +83,14 @@ export function MenuWindow() {
     setResultActionError(null);
     setPickerError(null);
     setIsPicking(false);
+    setIsInspectingSplit(false);
+    setSplitSource(null);
+    setSplitMode("every");
+    setSplitRanges("");
+    setSplitPlan(null);
+    setSplitPlanError(null);
+    setIsPlanning(false);
+    setOutputDirectory(null);
     setIsDropMode(false);
     setIsDragActive(false);
     setDragCount(0);
@@ -168,6 +190,76 @@ export function MenuWindow() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [isOpen, dismiss]);
 
+  const beginSplitSetup = useCallback(async () => {
+    if (isInspectingSplit) return;
+
+    setIsInspectingSplit(true);
+    setPickerError(null);
+    setSplitPlan(null);
+    setSplitPlanError(null);
+
+    try {
+      const before = await invoke<InputSelection>("get_input");
+      const source = await invoke<SplitSourceInfo>("inspect_split_source");
+      const after = await invoke<InputSelection>("get_input");
+
+      if (
+        after.files.length !== 1 ||
+        before.files[0]?.id !== after.files[0]?.id
+      ) {
+        setInputSelection(after);
+        setStage("input");
+        return;
+      }
+
+      setSplitSource(source);
+      setSplitMode("every");
+      setSplitRanges("");
+      setOutputDirectory(null);
+      setConversionResult(null);
+      setConversionError(null);
+      setResultActionError(null);
+      setStage("configure");
+    } catch (error) {
+      setPickerError(String(error));
+    } finally {
+      setIsInspectingSplit(false);
+    }
+  }, [isInspectingSplit]);
+
+  useEffect(() => {
+    if (stage !== "configure" || splitSource === null) return;
+
+    let disposed = false;
+    setIsPlanning(true);
+
+    const timer = window.setTimeout(() => {
+      void invoke<SplitPlan>("plan_split", {
+        pageCount: splitSource.pages,
+        mode: splitMode,
+        ranges: splitMode === "ranges" ? splitRanges : "",
+      })
+        .then((plan) => {
+          if (disposed) return;
+          setSplitPlan(plan);
+          setSplitPlanError(null);
+        })
+        .catch((error) => {
+          if (disposed) return;
+          setSplitPlan(null);
+          setSplitPlanError(String(error));
+        })
+        .finally(() => {
+          if (!disposed) setIsPlanning(false);
+        });
+    }, 180);
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+    };
+  }, [stage, splitSource, splitMode, splitRanges]);
+
   const openCategory = useCallback(async (category: RadialAction) => {
     setSelectedAction(category);
     setActionError(null);
@@ -195,6 +287,12 @@ export function MenuWindow() {
     setConversionResult(null);
     setConversionError(null);
     setResultActionError(null);
+    setSplitSource(null);
+    setSplitMode("every");
+    setSplitRanges("");
+    setSplitPlan(null);
+    setSplitPlanError(null);
+    setOutputDirectory(null);
 
     try {
       const started = await invoke<ActionInfo>("start_action", {
@@ -227,6 +325,10 @@ export function MenuWindow() {
       if (selection && selection.files.length > 0) {
         setInputSelection(selection);
         setOutputInfo(null);
+        setOutputDirectory(null);
+        setSplitSource(null);
+        setSplitPlan(null);
+        setSplitPlanError(null);
         setConversionResult(null);
         setConversionError(null);
         setResultActionError(null);
@@ -246,6 +348,10 @@ export function MenuWindow() {
       });
       setInputSelection(selection);
       setOutputInfo(null);
+      setOutputDirectory(null);
+      setSplitSource(null);
+      setSplitPlan(null);
+      setSplitPlanError(null);
       setConversionResult(null);
       setConversionError(null);
       setResultActionError(null);
@@ -275,6 +381,10 @@ export function MenuWindow() {
       const selection = await invoke<InputSelection>("get_input");
       setInputSelection(selection);
       setOutputInfo(null);
+      setOutputDirectory(null);
+      setSplitSource(null);
+      setSplitPlan(null);
+      setSplitPlanError(null);
       setOutputError(null);
       setConversionResult(null);
       setConversionError(null);
@@ -293,9 +403,18 @@ export function MenuWindow() {
     setResultActionError(null);
 
     try {
-      const info = await invoke<OutputInfo | null>("choose_output");
-      if (info) {
-        setOutputInfo(info);
+      if (selectedOperation?.id === "pdf.split") {
+        const info = await invoke<OutputDirectoryInfo | null>(
+          "choose_output_directory",
+        );
+        if (info) {
+          setOutputDirectory(info);
+        }
+      } else {
+        const info = await invoke<OutputInfo | null>("choose_output");
+        if (info) {
+          setOutputInfo(info);
+        }
       }
     } catch (error) {
       setOutputError(String(error));
@@ -313,11 +432,19 @@ export function MenuWindow() {
     setResultActionError(null);
 
     try {
-      const command =
-        selectedOperation?.id === "pdf.merge"
-          ? "merge_pdfs"
-          : "convert_to_pdf";
-      const result = await invoke<ConversionResult>(command);
+      let result: ConversionResult;
+      if (selectedOperation?.id === "pdf.split") {
+        result = await invoke<ConversionResult>("split_pdf", {
+          mode: splitMode,
+          ranges: splitMode === "ranges" ? splitRanges : "",
+        });
+      } else {
+        const command =
+          selectedOperation?.id === "pdf.merge"
+            ? "merge_pdfs"
+            : "convert_to_pdf";
+        result = await invoke<ConversionResult>(command);
+      }
       setConversionResult(result);
     } catch (error) {
       setConversionError(String(error));
@@ -326,7 +453,9 @@ export function MenuWindow() {
     }
   };
 
-  const runResultAction = async (command: "reveal_output" | "open_output") => {
+  const runResultAction = async (
+    command: "reveal_output" | "open_output" | "open_output_directory",
+  ) => {
     setResultActionError(null);
 
     try {
@@ -341,7 +470,7 @@ export function MenuWindow() {
     setConversionResult(null);
     setConversionError(null);
     setResultActionError(null);
-    setStage("review");
+    setStage(selectedOperation?.id === "pdf.split" ? "configure" : "review");
   };
 
   const enterDropMode = async () => {
@@ -391,8 +520,17 @@ export function MenuWindow() {
     stage === "input" && selectedOperation !== null && inputSelection !== null;
   const showReview =
     stage === "review" && selectedOperation !== null && inputSelection !== null;
+  const showConfigure =
+    stage === "configure" &&
+    selectedOperation !== null &&
+    splitSource !== null &&
+    inputSelection !== null;
   const showOutput =
     stage === "output" && selectedOperation !== null && inputSelection !== null;
+  const isSplit = selectedOperation?.id === "pdf.split";
+  const isMerge = selectedOperation?.id === "pdf.merge";
+  const minFiles = isSplit ? 1 : isMerge ? 2 : 1;
+  const fileNoun = isSplit ? "PDF" : isMerge ? "PDFs" : "images";
 
   return (
     <main className="app-shell">
@@ -412,8 +550,10 @@ export function MenuWindow() {
           actionLabel={selectedOperation.label}
           categoryIcon={selectedAction?.icon}
           mode="input"
-          minFiles={selectedOperation.id === "pdf.merge" ? 2 : 1}
-          fileNoun={selectedOperation.id === "pdf.merge" ? "PDFs" : "images"}
+          minFiles={minFiles}
+          fileNoun={fileNoun}
+          continueLabel={isSplit ? "Configure split" : undefined}
+          isContinuing={isSplit ? isInspectingSplit : false}
           isPicking={isPicking}
           isDropMode={isDropMode}
           isDragActive={isDragActive}
@@ -426,7 +566,13 @@ export function MenuWindow() {
           onBack={backToActions}
           onEnterDrop={() => void enterDropMode()}
           onCancelDrop={cancelDropMode}
-          onContinue={() => setStage("review")}
+          onContinue={() => {
+            if (isSplit) {
+              void beginSplitSetup();
+            } else {
+              setStage("review");
+            }
+          }}
           onReorder={(ids) => void reorderFiles(ids)}
           onDismiss={dismiss}
         />
@@ -436,8 +582,8 @@ export function MenuWindow() {
           actionLabel={selectedOperation.label}
           categoryIcon={selectedAction?.icon}
           mode="review"
-          minFiles={selectedOperation.id === "pdf.merge" ? 2 : 1}
-          fileNoun={selectedOperation.id === "pdf.merge" ? "PDFs" : "images"}
+          minFiles={minFiles}
+          fileNoun={fileNoun}
           isPicking={isPicking}
           isDropMode={false}
           isDragActive={false}
@@ -454,15 +600,42 @@ export function MenuWindow() {
           onReorder={(ids) => void reorderFiles(ids)}
           onDismiss={dismiss}
         />
+      ) : showConfigure ? (
+        <SplitSettings
+          source={splitSource}
+          mode={splitMode}
+          ranges={splitRanges}
+          plan={splitPlan}
+          isPlanning={isPlanning}
+          error={splitPlanError}
+          categoryIcon={selectedAction?.icon}
+          onModeChange={(mode) => {
+            setSplitMode(mode);
+            setIsPlanning(true);
+            setSplitPlanError(null);
+          }}
+          onRangesChange={(value) => {
+            setSplitRanges(value);
+            setIsPlanning(true);
+            setSplitPlanError(null);
+          }}
+          onBack={() => setStage("input")}
+          onContinue={() => setStage("output")}
+          onDismiss={dismiss}
+        />
       ) : showOutput ? (
         <OutputPanel
           category={selectedAction}
           actionLabel={selectedOperation.label}
           selection={inputSelection}
           output={outputInfo}
+          outputDirectory={outputDirectory}
           isChoosing={isChoosingOutput}
           isConverting={isConverting}
-          isMerge={selectedOperation.id === "pdf.merge"}
+          isMerge={isMerge}
+          isSplit={isSplit}
+          splitMode={splitMode}
+          splitPlan={splitPlan}
           result={conversionResult}
           error={conversionError ?? outputError}
           resultError={resultActionError}
@@ -470,6 +643,7 @@ export function MenuWindow() {
           onConvert={() => void convert()}
           onReveal={() => void runResultAction("reveal_output")}
           onOpen={() => void runResultAction("open_output")}
+          onOpenFolder={() => void runResultAction("open_output_directory")}
           onBack={backToReview}
           onDismiss={dismiss}
         />

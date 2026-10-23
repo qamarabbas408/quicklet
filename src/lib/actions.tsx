@@ -39,9 +39,42 @@ export type OutputInfo = {
   directory: string;
 };
 
+export type OutputDirectoryInfo = {
+  directory: string;
+};
+
+export type SplitMode = "every" | "ranges";
+
+export type SplitSourceInfo = {
+  name: string;
+  pages: number;
+  bytes: number;
+  maxPages: number;
+  maxOutputs: number;
+  maxInputBytes: number;
+};
+
+export type SplitOutputPlan = {
+  name: string;
+  pages: number[];
+};
+
+export type SplitPlan = {
+  pageCount: number;
+  outputs: SplitOutputPlan[];
+  excludedPages: number[];
+};
+
+export type ConversionFile = {
+  name: string;
+  pages: number;
+  bytesWritten: number;
+};
+
 export type ConversionResult = {
   pages: number;
   bytesWritten: number;
   name: string;
   directory: string;
+  files?: ConversionFile[];
 };
