@@ -1,3 +1,5 @@
+import quickletIcon from "../assets/quicklet-icon.png";
+
 type IconProps = {
   className?: string;
 };
@@ -76,15 +78,13 @@ export function CloseIcon({ className }: IconProps) {
 
 export function QuickletMark({ className }: IconProps) {
   return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="currentColor"
+    <img
+      src={quickletIcon}
+      alt=""
       aria-hidden="true"
-      focusable="false"
-      className={className}
-    >
-      <path d="M13.2 2.2 4.6 13.1c-.4.5 0 1.3.7 1.3h4.9l-1.3 7.1c-.1.8.9 1.2 1.4.6l8.8-11.1c.4-.5 0-1.3-.7-1.3h-5l1.3-6.8c.1-.8-.9-1.2-1.5-.7Z" />
-    </svg>
+      draggable={false}
+      className={className ? `${className} object-contain` : "object-contain"}
+    />
   );
 }
 
