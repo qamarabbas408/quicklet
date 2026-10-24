@@ -393,7 +393,7 @@ fn placement(width: u32, height: u32, orientation: u32) -> Placement {
     } else {
         1
     };
-    let swapped = matches!(orientation, 5 | 6 | 7 | 8);
+    let swapped = (5..=8).contains(&orientation);
     let display_width = if swapped { height as f32 } else { width as f32 };
     let display_height = if swapped { width as f32 } else { height as f32 };
     let available_width = A4_WIDTH_PT - 2.0 * MARGIN_PT;
@@ -683,7 +683,7 @@ mod tests {
         doc.get_pages().into_values().collect()
     }
 
-    fn page_image_stream<'a>(doc: &'a Document, page_id: ObjectId) -> &'a lopdf::Stream {
+    fn page_image_stream(doc: &Document, page_id: ObjectId) -> &lopdf::Stream {
         let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
         let resources = page.get(b"Resources").unwrap().as_dict().unwrap();
         let xobjects = resources.get(b"XObject").unwrap().as_dict().unwrap();
@@ -873,8 +873,8 @@ mod tests {
             for (u, v) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
                 let x = placement.a * u + placement.c * v + placement.e;
                 let y = placement.b * u + placement.d * v + placement.f;
-                assert!(x >= -0.01 && x <= A4_WIDTH_PT + 0.01);
-                assert!(y >= -0.01 && y <= A4_HEIGHT_PT + 0.01);
+                assert!((-0.01..=A4_WIDTH_PT + 0.01).contains(&x));
+                assert!((-0.01..=A4_HEIGHT_PT + 0.01).contains(&y));
             }
         }
     }
@@ -989,7 +989,7 @@ mod tests {
 
         fs::write(&output, b"sentinel").unwrap();
         assert!(matches!(
-            convert_images_to_pdf(&[input.clone()], &output),
+            convert_images_to_pdf(std::slice::from_ref(&input), &output),
             Err(PdfError::OutputExists { .. })
         ));
         assert_eq!(fs::read(&output).unwrap(), b"sentinel");
@@ -1025,7 +1025,7 @@ mod tests {
         fs::write(&output, b"old content").unwrap();
 
         assert!(matches!(
-            convert_images_to_pdf(&[input.clone()], &output),
+            convert_images_to_pdf(std::slice::from_ref(&input), &output),
             Err(PdfError::OutputExists { .. })
         ));
         assert_eq!(fs::read(&output).unwrap(), b"old content");

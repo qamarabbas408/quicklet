@@ -327,10 +327,8 @@ fn flatten_page_tree(
             (b"CropBox".as_slice(), inherited.crop_box.as_ref()),
             (b"Rotate".as_slice(), inherited.rotate.as_ref()),
         ] {
-            if page.get(key).is_err() {
-                if let Some(value) = value {
-                    page.set(key, value.clone());
-                }
+            if page.get(key).is_err() && let Some(value) = value {
+                page.set(key, value.clone());
             }
         }
     }
@@ -770,7 +768,7 @@ mod tests {
         document.get_pages().into_values().collect()
     }
 
-    fn page_dictionary<'a>(document: &'a Document, page_id: ObjectId) -> &'a Dictionary {
+    fn page_dictionary(document: &Document, page_id: ObjectId) -> &Dictionary {
         document.get_object(page_id).unwrap().as_dict().unwrap()
     }
 
@@ -1103,7 +1101,7 @@ mod tests {
         let output = dir.path().join("out.pdf");
 
         assert!(matches!(
-            merge_pdfs(&[input.clone()], &output),
+            merge_pdfs(std::slice::from_ref(&input), &output),
             Err(MergeError::TooFewInputs)
         ));
 
