@@ -1,5 +1,6 @@
 pub mod compress;
 pub mod merge;
+pub mod naming;
 pub mod pdf;
 pub mod split;
 
@@ -420,9 +421,16 @@ fn reorder_input(app: AppHandle, ids: Vec<u64>) -> Result<InputSelection, String
 async fn choose_output(
     app: AppHandle,
     window: WebviewWindow,
+    preset: Option<String>,
 ) -> Result<Option<OutputInfo>, String> {
     let state = app.state::<InputState>();
     ensure_not_converting(&state)?;
+    let action_id = state
+        .action_id
+        .lock()
+        .map(|action_id| action_id.clone())
+        .unwrap_or(None)
+        .ok_or_else(|| "Choose an action first.".to_string())?;
     let files = state
         .files
         .lock()
@@ -433,6 +441,20 @@ async fn choose_output(
         return Err("Add files before choosing an output.".to_string());
     }
 
+    let compression_preset = if action_id == "pdf.compress" {
+        let preset = preset
+            .as_deref()
+            .ok_or_else(|| "Choose a compression preset first.".to_string())?;
+        Some(
+            compress::CompressionPreset::parse(preset)
+                .ok_or_else(|| "Choose a valid compression preset.".to_string())?,
+        )
+    } else {
+        None
+    };
+    let default_name = naming::default_output_name(&action_id, compression_preset, Local::now())
+        .ok_or_else(|| "This action does not use a single output file.".to_string())?;
+
     state.dialog_open.store(true, Ordering::SeqCst);
 
     let dialog = app
@@ -441,7 +463,7 @@ async fn choose_output(
         .set_title("Save PDF")
         .set_parent(&window)
         .add_filter("PDF", &["pdf"])
-        .set_file_name(default_output_name());
+        .set_file_name(default_name);
 
     let (sender, receiver) = std::sync::mpsc::channel();
     dialog.save_file(move |path| {
@@ -1057,10 +1079,6 @@ fn open_output(app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(path.to_string_lossy().into_owned(), None::<&str>)
         .map_err(|error| error.to_string())
-}
-
-fn default_output_name() -> String {
-    format!("Quicklet-{}.pdf", Local::now().format("%Y-%m-%d"))
 }
 
 fn ensure_pdf_extension(path: PathBuf) -> PathBuf {
@@ -2209,15 +2227,6 @@ mod tests {
             super::ensure_pdf_extension(std::path::PathBuf::from("/tmp/out.PDF")),
             std::path::PathBuf::from("/tmp/out.PDF")
         );
-    }
-
-    #[test]
-    fn defaults_output_name_to_quicklet_date() {
-        let expected = format!("Quicklet-{}.pdf", chrono::Local::now().format("%Y-%m-%d"));
-
-        assert_eq!(super::default_output_name(), expected);
-        assert!(super::default_output_name().starts_with("Quicklet-"));
-        assert!(super::default_output_name().ends_with(".pdf"));
     }
 
     #[test]

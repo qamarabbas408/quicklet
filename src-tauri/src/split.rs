@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use tempfile::NamedTempFile;
 
+use crate::naming;
+
 pub const MAX_SPLIT_PAGES: usize = 2_000;
 pub const MAX_SPLIT_OUTPUTS: usize = 500;
 pub const MAX_SPLIT_RANGES: usize = 100;
@@ -279,7 +281,7 @@ pub fn plan_split(
     let outputs = ranges
         .into_iter()
         .map(|range| SplitOutputPlan {
-            name: output_name(stem, range.start, range.end),
+            name: naming::split_output_name(stem, range.start, range.end),
             pages: (range.start..=range.end).collect(),
         })
         .collect();
@@ -508,14 +510,6 @@ fn parse_page_number(value: &str) -> Result<usize, &'static str> {
     }
 
     Ok(number)
-}
-
-fn output_name(stem: &str, start: usize, end: usize) -> String {
-    if start == end {
-        format!("{stem}-page-{start:03}.pdf")
-    } else {
-        format!("{stem}-pages-{start:03}-{end:03}.pdf")
-    }
 }
 
 fn page_entries(document: &Document, source: &Path) -> Result<Vec<PageEntry>, SplitError> {
@@ -1367,9 +1361,9 @@ mod tests {
                 .map(|file| file.name.as_str())
                 .collect::<Vec<_>>(),
             [
-                "Report-page-001.pdf",
-                "Report-page-002.pdf",
-                "Report-page-003.pdf"
+                "Quicklet-Split-Report-page-001.pdf",
+                "Quicklet-Split-Report-page-002.pdf",
+                "Quicklet-Split-Report-page-003.pdf"
             ]
         );
 
@@ -1384,14 +1378,14 @@ mod tests {
             assert!(page_text(&document, ids[0]).contains(expected));
         }
 
-        let first = Document::load(output.join("Report-page-001.pdf")).unwrap();
+        let first = Document::load(output.join("Quicklet-Split-Report-page-001.pdf")).unwrap();
         assert_eq!(media_box(&first, page_ids(&first)[0]), (595.0, 842.0));
 
-        let second = Document::load(output.join("Report-page-002.pdf")).unwrap();
+        let second = Document::load(output.join("Quicklet-Split-Report-page-002.pdf")).unwrap();
         assert_eq!(media_box(&second, page_ids(&second)[0]), (612.0, 792.0));
         assert_eq!(rotation(&second, page_ids(&second)[0]), 90);
 
-        let third = Document::load(output.join("Report-page-003.pdf")).unwrap();
+        let third = Document::load(output.join("Quicklet-Split-Report-page-003.pdf")).unwrap();
         assert_eq!(media_box(&third, page_ids(&third)[0]), (400.0, 300.0));
 
         assert_eq!(source_bytes(&source), original);
@@ -1417,9 +1411,9 @@ mod tests {
                 .map(|output| output.name.as_str())
                 .collect::<Vec<_>>(),
             [
-                "Report-page-001.pdf",
-                "Report-pages-003-005.pdf",
-                "Report-page-008.pdf"
+                "Quicklet-Split-Report-page-001.pdf",
+                "Quicklet-Split-Report-pages-003-005.pdf",
+                "Quicklet-Split-Report-page-008.pdf"
             ]
         );
 
@@ -1428,7 +1422,8 @@ mod tests {
         assert_eq!(outcome.files.len(), 3);
         assert_eq!(outcome.files[1].pages, 3);
 
-        let second = Document::load(output.join("Report-pages-003-005.pdf")).unwrap();
+        let second =
+            Document::load(output.join("Quicklet-Split-Report-pages-003-005.pdf")).unwrap();
         let texts = page_ids(&second)
             .into_iter()
             .map(|id| page_text(&second, id))
@@ -1493,19 +1488,21 @@ mod tests {
         );
 
         split_pdf(&source, &every, SplitMode::EveryPage, "").unwrap();
-        let first = Document::load(every.join("Links-page-001.pdf")).unwrap();
+        let first = Document::load(every.join("Quicklet-Split-Links-page-001.pdf")).unwrap();
         assert!(link_targets(&first, page_ids(&first)[0]).is_empty());
 
         let first_two_outcome = split_pdf(&source, &first_two, SplitMode::Ranges, "1-2").unwrap();
         assert_eq!(first_two_outcome.files.len(), 1);
-        let first_two_doc = Document::load(first_two.join("Links-pages-001-002.pdf")).unwrap();
+        let first_two_doc =
+            Document::load(first_two.join("Quicklet-Split-Links-pages-001-002.pdf")).unwrap();
         let ids = page_ids(&first_two_doc);
         assert_eq!(ids.len(), 2);
         assert_eq!(link_targets(&first_two_doc, ids[0]), vec![2]);
         assert_eq!(link_targets(&first_two_doc, ids[1]), vec![1]);
 
         split_pdf(&source, &last_two, SplitMode::Ranges, "2-3").unwrap();
-        let last_two_doc = Document::load(last_two.join("Links-pages-002-003.pdf")).unwrap();
+        let last_two_doc =
+            Document::load(last_two.join("Quicklet-Split-Links-pages-002-003.pdf")).unwrap();
         let ids = page_ids(&last_two_doc);
         assert!(link_targets(&last_two_doc, ids[0]).is_empty());
         assert!(link_targets(&last_two_doc, ids[1]).is_empty());
@@ -1520,7 +1517,7 @@ mod tests {
         write_image_pdf(&source);
 
         split_pdf(&source, &output, SplitMode::EveryPage, "").unwrap();
-        let document = Document::load(output.join("Image-page-001.pdf")).unwrap();
+        let document = Document::load(output.join("Quicklet-Split-Image-page-001.pdf")).unwrap();
         let id = page_ids(&document)[0];
         assert!(page_text(&document, id).contains("C1 image page"));
         assert_eq!(image_count(&document), 1);
@@ -1532,7 +1529,8 @@ mod tests {
         fs::create_dir(&nested_output).unwrap();
         write_nested_inherited_pdf(&nested);
         split_pdf(&nested, &nested_output, SplitMode::EveryPage, "").unwrap();
-        let document = Document::load(nested_output.join("Nested-page-001.pdf")).unwrap();
+        let document =
+            Document::load(nested_output.join("Quicklet-Split-Nested-page-001.pdf")).unwrap();
         let id = page_ids(&document)[0];
         assert!(page_text(&document, id).contains("Nested inherited page"));
         assert_eq!(media_box(&document, id), (595.0, 842.0));
@@ -1597,7 +1595,7 @@ mod tests {
             ],
         );
         let original = source_bytes(&source);
-        let existing = output.join("Report-page-002.pdf");
+        let existing = output.join("Quicklet-Split-Report-page-002.pdf");
         fs::write(&existing, b"keep me").unwrap();
 
         let error = split_pdf(&source, &output, SplitMode::EveryPage, "").unwrap_err();
@@ -1606,8 +1604,8 @@ mod tests {
         };
         assert_eq!(paths, vec![existing.clone()]);
         assert_eq!(fs::read(&existing).unwrap(), b"keep me");
-        assert!(!output.join("Report-page-001.pdf").exists());
-        assert!(!output.join("Report-page-003.pdf").exists());
+        assert!(!output.join("Quicklet-Split-Report-page-001.pdf").exists());
+        assert!(!output.join("Quicklet-Split-Report-page-003.pdf").exists());
         assert_eq!(source_bytes(&source), original);
     }
 
@@ -1645,9 +1643,9 @@ mod tests {
 
         let error = split_pdf(&source, &output, SplitMode::EveryPage, "").unwrap_err();
         assert!(matches!(error, SplitError::InvalidReference { .. }));
-        assert!(!output.join("Report-page-001.pdf").exists());
-        assert!(!output.join("Report-page-002.pdf").exists());
-        assert!(!output.join("Report-page-003.pdf").exists());
+        assert!(!output.join("Quicklet-Split-Report-page-001.pdf").exists());
+        assert!(!output.join("Quicklet-Split-Report-page-002.pdf").exists());
+        assert!(!output.join("Quicklet-Split-Report-page-003.pdf").exists());
         assert_eq!(source_bytes(&source), original);
     }
 

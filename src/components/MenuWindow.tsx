@@ -475,7 +475,12 @@ export function MenuWindow() {
           setOutputDirectory(info);
         }
       } else {
-        const info = await invoke<OutputInfo | null>("choose_output");
+        const info = await invoke<OutputInfo | null>("choose_output", {
+          preset:
+            selectedOperation?.id === "pdf.compress"
+              ? compressionPreset
+              : null,
+        });
         if (info) {
           setOutputInfo(info);
         }
@@ -717,7 +722,11 @@ export function MenuWindow() {
           source={compressSource}
           preset={compressionPreset}
           categoryIcon={selectedAction?.icon}
-          onPresetChange={setCompressionPreset}
+          onPresetChange={(preset) => {
+            setCompressionPreset(preset);
+            setOutputInfo(null);
+            setOutputError(null);
+          }}
           onBack={() => setStage("input")}
           onContinue={() => setStage("output")}
           onDismiss={dismiss}
