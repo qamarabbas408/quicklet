@@ -4,6 +4,8 @@ import type {
   ConversionResult,
   OutputDirectoryInfo,
   OutputInfo,
+  PageSelectionMode,
+  PageSelectionPlan,
   RadialAction,
   SplitMode,
   SplitPlan,
@@ -24,6 +26,8 @@ type OutputPanelProps = {
   isCompress: boolean;
   compressionPreset: CompressionPreset;
   compressSource: CompressionSourceInfo | null;
+  pageSelectionMode: PageSelectionMode | null;
+  pagePlan: PageSelectionPlan | null;
   splitMode: SplitMode;
   splitPlan: SplitPlan | null;
   result: ConversionResult | null;
@@ -51,6 +55,8 @@ export function OutputPanel({
   isCompress,
   compressionPreset,
   compressSource,
+  pageSelectionMode,
+  pagePlan,
   splitMode,
   splitPlan,
   result,
@@ -71,9 +77,13 @@ export function OutputPanel({
   const files = result?.files ?? [];
   const hasFileList = files.length > 0;
   const compression = result?.compression;
+  const isPageSelection = pageSelectionMode !== null;
+  const isExtract = pageSelectionMode === "extract";
   const canConvert = isSplit
     ? outputDirectory !== null && splitPlan !== null && !isChoosing && !isConverting
-    : output !== null && !isChoosing && !isConverting;
+    : isPageSelection
+      ? output !== null && pagePlan !== null && !isChoosing && !isConverting
+      : output !== null && !isChoosing && !isConverting;
   const splitExcluded = splitPlan?.excludedPages ?? [];
   const splitIncluded = splitPlan
     ? splitPlan.outputs.reduce((sum, item) => sum + item.pages.length, 0)
@@ -84,21 +94,33 @@ export function OutputPanel({
       ? "Merging PDFs…"
       : isCompress
         ? "Compressing PDF…"
-        : "Creating PDF…";
+        : isPageSelection
+          ? isExtract
+            ? "Extracting pages…"
+            : "Deleting pages…"
+          : "Creating PDF…";
   const actionLabelForButton = isSplit
     ? "Split PDF"
     : isMerge
       ? "Merge PDFs"
       : isCompress
         ? "Compress PDF"
-        : "Convert to PDF";
+        : isPageSelection
+          ? isExtract
+            ? "Extract Pages"
+            : "Delete Pages"
+          : "Convert to PDF";
   const retryLabel = isSplit
     ? "Retry split"
     : isMerge
       ? "Retry merge"
       : isCompress
         ? "Retry compression"
-        : "Retry conversion";
+        : isPageSelection
+          ? isExtract
+            ? "Retry extraction"
+            : "Retry deletion"
+          : "Retry conversion";
   const presetLabel = (preset: CompressionPreset) =>
     preset === "light"
       ? "Light"
@@ -143,7 +165,11 @@ export function OutputPanel({
               {result
                 ? isCompress
                   ? "Compression complete"
-                  : hasFileList
+                  : isPageSelection
+                    ? isExtract
+                      ? "Pages extracted"
+                      : "Pages deleted"
+                    : hasFileList
                     ? files.length === 1
                       ? "PDF created"
                       : "PDFs created"
@@ -296,7 +322,36 @@ export function OutputPanel({
           </>
         ) : (
           <>
-            {isCompress ? (
+            {isPageSelection ? (
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Format</span>
+                  <span className="text-white/85">PDF</span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Mode</span>
+                  <span className="text-white/85">
+                    {isExtract ? "Extract pages" : "Delete pages"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">
+                    {isExtract ? "Selected pages" : "Remove pages"}
+                  </span>
+                  <span className="text-white/85">
+                    {pagePlan?.selectedPages.length ?? "—"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">
+                    {isExtract ? "Output pages" : "Remaining pages"}
+                  </span>
+                  <span className="text-white/85">
+                    {pagePlan?.outputCount ?? "—"}
+                  </span>
+                </div>
+              </div>
+            ) : isCompress ? (
               <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
                 <div className="flex items-center justify-between text-[11px]">
                   <span className="text-white/45">Format</span>
@@ -487,7 +542,9 @@ export function OutputPanel({
               ? "Split settings"
               : isCompress
                 ? "Compression settings"
-                : "Review files"}
+                : isPageSelection
+                  ? "Page selection"
+                  : "Review files"}
           </button>
           <span className="text-white/30">Esc to dismiss</span>
         </div>

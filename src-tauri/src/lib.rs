@@ -1,6 +1,7 @@
 pub mod compress;
 pub mod merge;
 pub mod naming;
+pub mod organize;
 pub mod pdf;
 pub mod split;
 
@@ -164,6 +165,17 @@ struct CompressSourceInfo {
     images: usize,
     max_pages: usize,
     max_images: usize,
+    max_input_bytes: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PageSourceInfo {
+    name: String,
+    pages: usize,
+    bytes: u64,
+    max_pages: usize,
+    max_ranges: usize,
     max_input_bytes: u64,
 }
 
@@ -1056,6 +1068,163 @@ async fn compress_pdf(app: AppHandle, preset: String) -> Result<ConversionResult
     })
 }
 
+#[tauri::command]
+async fn inspect_page_source(app: AppHandle) -> Result<PageSourceInfo, String> {
+    let (_, path) = page_selection_input_path(&app)?;
+    let task_path = path.clone();
+
+    let source = tauri::async_runtime::spawn_blocking(move || split::inspect_pdf(&task_path))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document.pdf".to_string());
+
+    Ok(PageSourceInfo {
+        name,
+        pages: source.pages,
+        bytes: source.bytes,
+        max_pages: split::MAX_SPLIT_PAGES,
+        max_ranges: split::MAX_SPLIT_RANGES,
+        max_input_bytes: split::MAX_SPLIT_INPUT_BYTES,
+    })
+}
+
+#[tauri::command]
+fn plan_page_selection(
+    app: AppHandle,
+    page_count: usize,
+    selection: String,
+) -> Result<organize::PageSelectionPlan, String> {
+    let (action_id, _) = page_selection_input_path(&app)?;
+    let mode = organize::PageSelectionMode::from_action_id(&action_id)
+        .ok_or_else(|| "This action is not available yet.".to_string())?;
+
+    organize::plan(page_count, &selection, mode).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn extract_pages(app: AppHandle, selection: String) -> Result<ConversionResult, String> {
+    run_page_selection(app, organize::PageSelectionMode::Extract, selection).await
+}
+
+#[tauri::command]
+async fn delete_pages(app: AppHandle, selection: String) -> Result<ConversionResult, String> {
+    run_page_selection(app, organize::PageSelectionMode::Delete, selection).await
+}
+
+async fn run_page_selection(
+    app: AppHandle,
+    mode: organize::PageSelectionMode,
+    selection: String,
+) -> Result<ConversionResult, String> {
+    let (action_id, path) = page_selection_input_path(&app)?;
+    if organize::PageSelectionMode::from_action_id(&action_id) != Some(mode) {
+        return Err("This action is not available yet.".to_string());
+    }
+
+    let output_path = {
+        let state = app.state::<InputState>();
+        let output_path = state
+            .output_path
+            .lock()
+            .map(|output| output.clone())
+            .unwrap_or(None)
+            .ok_or_else(|| "Choose an output destination first.".to_string())?;
+
+        if state
+            .conversion_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("A conversion is already running.".to_string());
+        }
+
+        output_path
+    };
+
+    let guard_app = app.clone();
+    let task_output = output_path.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ConversionBusyGuard { app: guard_app };
+        match mode {
+            organize::PageSelectionMode::Extract => {
+                organize::extract(&path, &task_output, &selection, true)
+            }
+            organize::PageSelectionMode::Delete => {
+                organize::delete(&path, &task_output, &selection, true)
+            }
+        }
+    })
+    .await;
+
+    let outcome = match joined {
+        Ok(result) => result.map_err(|error| error.to_string())?,
+        Err(error) => {
+            app.state::<InputState>()
+                .conversion_in_progress
+                .store(false, Ordering::SeqCst);
+            return Err(error.to_string());
+        }
+    };
+
+    if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
+        *last_output = Some(output_path.clone());
+    }
+    if let Ok(mut last_output_directory) = app.state::<InputState>().last_output_directory.lock() {
+        *last_output_directory = None;
+    }
+
+    let name = output_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output.pdf".to_string());
+    let directory = output_path
+        .parent()
+        .map(|directory| directory.display().to_string())
+        .unwrap_or_default();
+
+    Ok(ConversionResult {
+        pages: outcome.pages,
+        bytes_written: outcome.bytes_written,
+        name,
+        directory,
+        files: None,
+        compression: None,
+    })
+}
+
+fn page_selection_input_path(app: &AppHandle) -> Result<(String, PathBuf), String> {
+    let state = app.state::<InputState>();
+    ensure_not_converting(&state)?;
+
+    let action_id = state
+        .action_id
+        .lock()
+        .map(|action_id| action_id.clone())
+        .unwrap_or(None)
+        .ok_or_else(|| "Choose an action first.".to_string())?;
+
+    if organize::PageSelectionMode::from_action_id(&action_id).is_none() {
+        return Err("This action is not available yet.".to_string());
+    }
+
+    let files = state
+        .files
+        .lock()
+        .map(|files| files.clone())
+        .unwrap_or_default();
+
+    if files.len() != 1 {
+        return Err("Select exactly one PDF.".to_string());
+    }
+
+    Ok((action_id, files[0].path.clone()))
+}
+
 fn last_output_path(state: &InputState) -> Result<PathBuf, String> {
     state
         .last_output
@@ -1439,7 +1608,10 @@ fn compress_input_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn max_files_for_action(action_id: &str) -> usize {
-    if matches!(action_id, "pdf.split" | "pdf.compress") {
+    if matches!(
+        action_id,
+        "pdf.split" | "pdf.compress" | "pdf.extract_pages" | "pdf.delete_pages"
+    ) {
         1
     } else {
         MAX_INPUT_FILES
@@ -1449,7 +1621,9 @@ fn max_files_for_action(action_id: &str) -> usize {
 fn action_input_kind(action_id: &str) -> Option<&'static str> {
     match action_id {
         "images.convert_to_pdf" => Some("images"),
-        "pdf.merge" | "pdf.split" | "pdf.compress" => Some("pdf"),
+        "pdf.merge" | "pdf.split" | "pdf.compress" | "pdf.extract_pages" | "pdf.delete_pages" => {
+            Some("pdf")
+        }
         _ => None,
     }
 }
@@ -1534,9 +1708,16 @@ fn category_actions(category_id: &str) -> Vec<ActionInfo> {
             ),
             action(
                 "pdf.extract_pages",
-                "Extract pages",
-                "Save selected pages",
-                false,
+                "Extract Pages",
+                "Keep only selected pages in a new PDF",
+                true,
+                Some("pdf"),
+            ),
+            action(
+                "pdf.delete_pages",
+                "Delete Pages",
+                "Remove selected pages from a copy",
+                true,
                 Some("pdf"),
             ),
         ],
@@ -1985,6 +2166,10 @@ pub fn run() {
             split_pdf,
             inspect_compress_source,
             compress_pdf,
+            inspect_page_source,
+            plan_page_selection,
+            extract_pages,
+            delete_pages,
             reveal_output,
             open_output,
             open_output_directory
@@ -2074,6 +2259,12 @@ mod tests {
             super::filter_for_action("pdf.compress").expect("PDF compress should have filters");
         assert_eq!(compress_name, "PDF documents");
         assert_eq!(compress_extensions, &["pdf"]);
+
+        for action in ["pdf.extract_pages", "pdf.delete_pages"] {
+            let (name, extensions) = super::filter_for_action(action).expect("PDF page action");
+            assert_eq!(name, "PDF documents");
+            assert_eq!(extensions, &["pdf"]);
+        }
 
         assert!(super::filter_for_action("compress.files").is_none());
         assert!(super::filter_for_action("settings.preferences").is_none());
@@ -2184,6 +2375,13 @@ mod tests {
                 .iter()
                 .any(|action| action.id == "pdf.compress" && action.enabled)
         );
+        for id in ["pdf.extract_pages", "pdf.delete_pages"] {
+            assert!(
+                pdf_actions
+                    .iter()
+                    .any(|action| action.id == id && action.enabled)
+            );
+        }
     }
 
     #[test]
@@ -2209,10 +2407,28 @@ mod tests {
 
         let compress_state = super::InputState::default();
         let compress_outcome =
-            super::ingest_paths(&compress_state, "pdf.compress", vec![first, second], false);
+            super::ingest_paths(
+                &compress_state,
+                "pdf.compress",
+                vec![first.clone(), second.clone()],
+                false,
+            );
         assert_eq!(compress_outcome.accepted, 1);
         assert_eq!(compress_outcome.selection.limit, 1);
         assert_eq!(compress_outcome.selection.limit_skipped, 1);
+
+        for action in ["pdf.extract_pages", "pdf.delete_pages"] {
+            let state = super::InputState::default();
+            let outcome = super::ingest_paths(
+                &state,
+                action,
+                vec![first.clone(), second.clone()],
+                false,
+            );
+            assert_eq!(outcome.accepted, 1);
+            assert_eq!(outcome.selection.limit, 1);
+            assert_eq!(outcome.selection.limit_skipped, 1);
+        }
 
         std::fs::remove_dir_all(dir).expect("test directory should be removed");
     }

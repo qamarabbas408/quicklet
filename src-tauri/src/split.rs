@@ -11,6 +11,9 @@
 //!
 //! Each output is rebuilt with only the objects reachable from its selected
 //! pages. Catalog-level structures from the source are intentionally dropped.
+//!
+//! The same page-copying path also backs Extract Pages and Delete Pages. Those
+//! actions write one selected-page PDF rather than a set of split files.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -100,6 +103,7 @@ pub enum SplitError {
     TooManyRanges { max: usize },
     InvalidRanges(String),
     OutputDirectoryInvalid { path: PathBuf },
+    OutputMatchesInput { path: PathBuf },
     OutputCollision { paths: Vec<PathBuf> },
     OutputWrite { path: PathBuf, source: io::Error },
 }
@@ -147,6 +151,11 @@ impl fmt::Display for SplitError {
             Self::OutputDirectoryInvalid { path } => write!(
                 formatter,
                 "Output folder does not exist: {}",
+                path.display()
+            ),
+            Self::OutputMatchesInput { path } => write!(
+                formatter,
+                "The output must not overwrite the source PDF: {}",
                 path.display()
             ),
             Self::OutputCollision { paths } => {
@@ -221,9 +230,9 @@ struct PageEntry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PageRange {
-    start: usize,
-    end: usize,
+pub(crate) struct PageRange {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 pub fn inspect_pdf(input: &Path) -> Result<SplitSource, SplitError> {
@@ -261,7 +270,7 @@ pub fn plan_split(
                 })
                 .collect::<Vec<_>>()
         }
-        SplitMode::Ranges => parse_ranges(ranges, page_count)?,
+        SplitMode::Ranges => parse_ranges(ranges, page_count, true)?,
     };
 
     if ranges.len() > MAX_SPLIT_OUTPUTS {
@@ -327,7 +336,7 @@ pub fn split_pdf(
             }
         };
 
-        if let Err(error) = write_safely(&target, &bytes) {
+        if let Err(error) = write_safely(&target, &bytes, false) {
             cleanup_created(&created);
             return Err(error);
         }
@@ -347,6 +356,136 @@ pub fn split_pdf(
         pages: total_pages,
         bytes_written: total_bytes,
     })
+}
+
+#[derive(Clone, Debug)]
+pub struct PageSelectionOutcome {
+    pub pages: usize,
+    pub bytes_written: u64,
+}
+
+/// Writes one PDF containing `pages` in the requested order.
+///
+/// This reuses the split page-copying path: dimensions, rotation, content,
+/// fonts, images, resources, and inherited page attributes are preserved.
+/// Direct links are retained when both ends are selected; links to excluded
+/// pages are dropped.
+pub fn write_page_selection(
+    input: &Path,
+    output: &Path,
+    pages: &[usize],
+    allow_overwrite: bool,
+) -> Result<PageSelectionOutcome, SplitError> {
+    let (document, _) = load_document(input)?;
+    let entries = page_entries(&document, input)?;
+    validate_page_count(entries.len())?;
+
+    if pages.is_empty() {
+        return Err(SplitError::InvalidRanges(
+            "Select at least one page.".to_string(),
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    for &page in pages {
+        if page == 0 || page > entries.len() {
+            return Err(SplitError::InvalidRanges(format!(
+                "Page {page} is outside this PDF. It has {} {}.",
+                entries.len(),
+                if entries.len() == 1 { "page" } else { "pages" }
+            )));
+        }
+        if !seen.insert(page) {
+            return Err(SplitError::InvalidRanges(format!(
+                "Page {page} appears more than once in the selection."
+            )));
+        }
+    }
+
+    validate_single_output(input, output, allow_overwrite)?;
+
+    let bytes = build_output(&document, &entries, pages, input)?;
+    write_safely(output, &bytes, allow_overwrite)?;
+
+    Ok(PageSelectionOutcome {
+        pages: pages.len(),
+        bytes_written: bytes.len() as u64,
+    })
+}
+
+fn validate_single_output(
+    input: &Path,
+    output: &Path,
+    allow_overwrite: bool,
+) -> Result<(), SplitError> {
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    if !parent.is_dir() {
+        return Err(SplitError::OutputDirectoryInvalid {
+            path: parent.to_path_buf(),
+        });
+    }
+
+    let parent = fs::canonicalize(parent).map_err(|_| SplitError::OutputDirectoryInvalid {
+        path: parent.to_path_buf(),
+    })?;
+    let file_name = output
+        .file_name()
+        .ok_or_else(|| SplitError::OutputDirectoryInvalid {
+            path: parent.clone(),
+        })?;
+    let candidate = parent.join(file_name);
+    let input_canonical = fs::canonicalize(input).map_err(|_| SplitError::InvalidPdf {
+        path: input.to_path_buf(),
+        reason: "could not resolve the source path".to_string(),
+    })?;
+    let output_canonical = if output.exists() {
+        fs::canonicalize(output).map_err(|_| SplitError::OutputDirectoryInvalid {
+            path: output.to_path_buf(),
+        })?
+    } else {
+        candidate
+    };
+
+    if output_canonical == input_canonical {
+        return Err(SplitError::OutputMatchesInput {
+            path: output.to_path_buf(),
+        });
+    }
+
+    #[cfg(unix)]
+    if output.exists() {
+        use std::os::unix::fs::MetadataExt;
+
+        if let (Ok(input_metadata), Ok(output_metadata)) =
+            (fs::metadata(input), fs::metadata(output))
+            && input_metadata.dev() == output_metadata.dev()
+            && input_metadata.ino() == output_metadata.ino()
+        {
+            return Err(SplitError::OutputMatchesInput {
+                path: output.to_path_buf(),
+            });
+        }
+    }
+
+    if output.exists() {
+        if output.is_dir() {
+            return Err(SplitError::OutputWrite {
+                path: output.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::AlreadyExists, "output path is a directory"),
+            });
+        }
+        if !allow_overwrite {
+            return Err(SplitError::OutputCollision {
+                paths: vec![output.to_path_buf()],
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn load_document(path: &Path) -> Result<(Document, u64), SplitError> {
@@ -422,7 +561,18 @@ fn validate_page_count(page_count: usize) -> Result<(), SplitError> {
     Ok(())
 }
 
-fn parse_ranges(input: &str, page_count: usize) -> Result<Vec<PageRange>, SplitError> {
+pub(crate) fn parse_page_ranges(
+    input: &str,
+    page_count: usize,
+) -> Result<Vec<PageRange>, SplitError> {
+    parse_ranges(input, page_count, false)
+}
+
+fn parse_ranges(
+    input: &str,
+    page_count: usize,
+    require_ascending: bool,
+) -> Result<Vec<PageRange>, SplitError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(SplitError::InvalidRanges(
@@ -437,7 +587,7 @@ fn parse_ranges(input: &str, page_count: usize) -> Result<Vec<PageRange>, SplitE
         });
     }
 
-    let mut ranges = Vec::with_capacity(tokens.len());
+    let mut ranges: Vec<PageRange> = Vec::with_capacity(tokens.len());
     let mut previous_end = 0usize;
 
     for (index, token) in tokens.iter().enumerate() {
@@ -463,9 +613,17 @@ fn parse_ranges(input: &str, page_count: usize) -> Result<Vec<PageRange>, SplitE
                 if page_count == 1 { "page" } else { "pages" }
             )));
         }
-        if start <= previous_end {
+        if require_ascending && start <= previous_end {
             return Err(SplitError::InvalidRanges(format!(
                 "Ranges must be ascending and must not overlap. \"{token}\" overlaps an earlier range."
+            )));
+        }
+        if ranges
+            .iter()
+            .any(|range| start <= range.end && end >= range.start)
+        {
+            return Err(SplitError::InvalidRanges(format!(
+                "Ranges must not overlap or repeat pages. \"{token}\" overlaps an earlier range."
             )));
         }
 
@@ -943,7 +1101,7 @@ fn resolve_object<'a>(document: &'a Document, object: &'a Object) -> Option<&'a 
     }
 }
 
-fn write_safely(target: &Path, bytes: &[u8]) -> Result<(), SplitError> {
+fn write_safely(target: &Path, bytes: &[u8], allow_overwrite: bool) -> Result<(), SplitError> {
     let parent = target
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -966,7 +1124,13 @@ fn write_safely(target: &Path, bytes: &[u8]) -> Result<(), SplitError> {
             source,
         })?;
 
-    match temp.persist_noclobber(target) {
+    let persisted = if allow_overwrite {
+        temp.persist(target)
+    } else {
+        temp.persist_noclobber(target)
+    };
+
+    match persisted {
         Ok(file) => {
             drop(file);
             if let Ok(directory) = fs::File::open(parent) {
@@ -975,7 +1139,7 @@ fn write_safely(target: &Path, bytes: &[u8]) -> Result<(), SplitError> {
             Ok(())
         }
         Err(error) => {
-            if error.error.kind() == io::ErrorKind::AlreadyExists {
+            if !allow_overwrite && error.error.kind() == io::ErrorKind::AlreadyExists {
                 Err(SplitError::OutputCollision {
                     paths: vec![target.to_path_buf()],
                 })
@@ -1692,5 +1856,82 @@ mod tests {
             split_pdf(&source, &missing, SplitMode::EveryPage, ""),
             Err(SplitError::OutputDirectoryInvalid { .. })
         ));
+    }
+
+    #[test]
+    fn page_selection_writer_validates_pages_and_protects_outputs() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("Report.pdf");
+        write_test_pdf(
+            &source,
+            &[
+                TestPage::new(500.0, 700.0, 0, "Page 1", None),
+                TestPage::new(500.0, 700.0, 0, "Page 2", None),
+                TestPage::new(500.0, 700.0, 0, "Page 3", None),
+            ],
+        );
+        let original = source_bytes(&source);
+        let output = dir.path().join("selection.pdf");
+
+        assert!(matches!(
+            write_page_selection(&source, &output, &[], true),
+            Err(SplitError::InvalidRanges(_))
+        ));
+        assert!(matches!(
+            write_page_selection(&source, &output, &[1, 1], true),
+            Err(SplitError::InvalidRanges(_))
+        ));
+        assert!(matches!(
+            write_page_selection(&source, &output, &[4], true),
+            Err(SplitError::InvalidRanges(_))
+        ));
+
+        fs::write(&output, b"keep me").unwrap();
+        assert!(matches!(
+            write_page_selection(&source, &output, &[1], false),
+            Err(SplitError::OutputCollision { .. })
+        ));
+        assert_eq!(fs::read(&output).unwrap(), b"keep me");
+        assert_eq!(source_bytes(&source), original);
+
+        write_page_selection(&source, &output, &[2], true).unwrap();
+        let document = Document::load(&output).unwrap();
+        let ids = page_ids(&document);
+        assert_eq!(ids.len(), 1);
+        assert!(page_text(&document, ids[0]).contains("Page 2"));
+        assert_eq!(source_bytes(&source), original);
+
+        assert!(matches!(
+            write_page_selection(&source, &source, &[1], true),
+            Err(SplitError::OutputMatchesInput { .. })
+        ));
+        assert_eq!(source_bytes(&source), original);
+    }
+
+    #[test]
+    fn page_selection_preserves_images_fonts_and_inherited_resources() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("Image.pdf");
+        let output = dir.path().join("selected.pdf");
+        write_image_pdf(&source);
+
+        write_page_selection(&source, &output, &[1], true).unwrap();
+        let document = Document::load(&output).unwrap();
+        let ids = page_ids(&document);
+        assert_eq!(ids.len(), 1);
+        assert!(page_text(&document, ids[0]).contains("C1 image page"));
+        assert_eq!(image_count(&document), 1);
+        assert!(page_dictionary(&document, ids[0]).get(b"Resources").is_ok());
+        assert!(page_dictionary(&document, ids[0]).get(b"MediaBox").is_ok());
+
+        let nested = dir.path().join("Nested.pdf");
+        let nested_output = dir.path().join("nested-selected.pdf");
+        write_nested_inherited_pdf(&nested);
+        write_page_selection(&nested, &nested_output, &[1], true).unwrap();
+        let document = Document::load(&nested_output).unwrap();
+        let id = page_ids(&document)[0];
+        assert!(page_text(&document, id).contains("Nested inherited page"));
+        assert_eq!(media_box(&document, id), (595.0, 842.0));
+        assert!(page_dictionary(&document, id).get(b"Resources").is_ok());
     }
 }

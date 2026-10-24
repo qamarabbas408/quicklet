@@ -18,6 +18,8 @@ pub fn default_output_name(
     let action = match action_id {
         "images.convert_to_pdf" => "Images".to_string(),
         "pdf.merge" => "Merge".to_string(),
+        "pdf.extract_pages" => "Extract".to_string(),
+        "pdf.delete_pages" => "Delete-Pages".to_string(),
         "pdf.compress" => {
             format!("Compress-{}", compression_preset?.label())
         }
@@ -119,6 +121,14 @@ mod tests {
             Some("Quicklet-Merge-20261024-153045.pdf")
         );
         assert_eq!(
+            default_output_name("pdf.extract_pages", None, now).as_deref(),
+            Some("Quicklet-Extract-20261024-153045.pdf")
+        );
+        assert_eq!(
+            default_output_name("pdf.delete_pages", None, now).as_deref(),
+            Some("Quicklet-Delete-Pages-20261024-153045.pdf")
+        );
+        assert_eq!(
             default_output_name("pdf.compress", Some(CompressionPreset::Light), now).as_deref(),
             Some("Quicklet-Compress-Light-20261024-153045.pdf")
         );
@@ -164,6 +174,8 @@ mod tests {
         let names = [
             default_output_name("images.convert_to_pdf", None, now).unwrap(),
             default_output_name("pdf.merge", None, now).unwrap(),
+            default_output_name("pdf.extract_pages", None, now).unwrap(),
+            default_output_name("pdf.delete_pages", None, now).unwrap(),
             default_output_name("pdf.compress", Some(CompressionPreset::Balanced), now).unwrap(),
         ];
 

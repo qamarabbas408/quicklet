@@ -84,6 +84,25 @@ export type CompressionSourceInfo = {
   maxInputBytes: number;
 };
 
+export type PageSelectionMode = "extract" | "delete";
+
+export type PageSourceInfo = {
+  name: string;
+  pages: number;
+  bytes: number;
+  maxPages: number;
+  maxRanges: number;
+  maxInputBytes: number;
+};
+
+export type PageSelectionPlan = {
+  mode: PageSelectionMode;
+  pageCount: number;
+  selectedPages: number[];
+  outputPages: number[];
+  outputCount: number;
+};
+
 export type CompressionReport = {
   originalBytes: number;
   outputBytes: number;

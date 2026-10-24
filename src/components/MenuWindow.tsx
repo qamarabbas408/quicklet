@@ -5,6 +5,7 @@ import { ActionList } from "./ActionList";
 import { CompressionSettings } from "./CompressionSettings";
 import { FileConfirmation } from "./FileConfirmation";
 import { OutputPanel } from "./OutputPanel";
+import { PageSelectionSettings } from "./PageSelectionSettings";
 import { SplitSettings } from "./SplitSettings";
 import { QuickletMark } from "./icons";
 import { RadialMenu } from "./RadialMenu";
@@ -15,6 +16,9 @@ import type {
   ConversionResult,
   OutputDirectoryInfo,
   OutputInfo,
+  PageSelectionMode,
+  PageSelectionPlan,
+  PageSourceInfo,
   RadialAction,
   SplitMode,
   SplitPlan,
@@ -30,6 +34,7 @@ type Stage =
   | "review"
   | "configure"
   | "compression"
+  | "pages"
   | "output";
 
 type DragState = {
@@ -76,6 +81,12 @@ export function MenuWindow() {
     useState<CompressionSourceInfo | null>(null);
   const [compressionPreset, setCompressionPreset] =
     useState<CompressionPreset>("balanced");
+  const [isInspectingPages, setIsInspectingPages] = useState(false);
+  const [pageSource, setPageSource] = useState<PageSourceInfo | null>(null);
+  const [pageSelection, setPageSelection] = useState("");
+  const [pagePlan, setPagePlan] = useState<PageSelectionPlan | null>(null);
+  const [pagePlanError, setPagePlanError] = useState<string | null>(null);
+  const [isPlanningPages, setIsPlanningPages] = useState(false);
   const [pickerError, setPickerError] = useState<string | null>(null);
   const [isDropMode, setIsDropMode] = useState(false);
   const [isDragActive, setIsDragActive] = useState(false);
@@ -109,6 +120,12 @@ export function MenuWindow() {
     setIsInspectingCompress(false);
     setCompressSource(null);
     setCompressionPreset("balanced");
+    setIsInspectingPages(false);
+    setPageSource(null);
+    setPageSelection("");
+    setPagePlan(null);
+    setPagePlanError(null);
+    setIsPlanningPages(false);
     setIsDropMode(false);
     setIsDragActive(false);
     setDragCount(0);
@@ -172,6 +189,8 @@ export function MenuWindow() {
         setOutputInfo(null);
         setOutputDirectory(null);
         setCompressSource(null);
+        setPageSource(null);
+        setPagePlan(null);
         setConversionResult(null);
         setStage("input");
         setIsDropMode(false);
@@ -286,6 +305,82 @@ export function MenuWindow() {
     }
   }, [isInspectingCompress]);
 
+  const beginPageSelectionSetup = useCallback(async () => {
+    if (isInspectingPages) return;
+
+    setIsInspectingPages(true);
+    setPickerError(null);
+    setPageSource(null);
+    setPagePlan(null);
+    setPagePlanError(null);
+
+    try {
+      const before = await invoke<InputSelection>("get_input");
+      const source = await invoke<PageSourceInfo>("inspect_page_source");
+      const after = await invoke<InputSelection>("get_input");
+
+      if (
+        after.files.length !== 1 ||
+        before.files[0]?.id !== after.files[0]?.id
+      ) {
+        setInputSelection(after);
+        setStage("input");
+        return;
+      }
+
+      setPageSource(source);
+      setPageSelection("");
+      setOutputInfo(null);
+      setOutputError(null);
+      setConversionResult(null);
+      setConversionError(null);
+      setResultActionError(null);
+      setStage("pages");
+    } catch (error) {
+      setPickerError(String(error));
+    } finally {
+      setIsInspectingPages(false);
+    }
+  }, [isInspectingPages]);
+
+  useEffect(() => {
+    if (stage !== "pages" || pageSource === null) return;
+    if (pageSelection.trim() === "") {
+      setPagePlan(null);
+      setPagePlanError(null);
+      setIsPlanningPages(false);
+      return;
+    }
+
+    let disposed = false;
+    setIsPlanningPages(true);
+
+    const timer = window.setTimeout(() => {
+      void invoke<PageSelectionPlan>("plan_page_selection", {
+        pageCount: pageSource.pages,
+        selection: pageSelection,
+      })
+        .then((plan) => {
+          if (disposed) return;
+          setPagePlan(plan);
+          setPagePlanError(null);
+        })
+        .catch((error) => {
+          if (disposed) return;
+          setPagePlan(null);
+          setPagePlanError(String(error));
+        })
+        .finally(() => {
+          if (!disposed) setIsPlanningPages(false);
+        });
+    }, 180);
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+    };
+  }, [stage, pageSource, pageSelection]);
+
   useEffect(() => {
     if (stage !== "configure" || splitSource === null) return;
 
@@ -354,6 +449,10 @@ export function MenuWindow() {
     setOutputDirectory(null);
     setCompressSource(null);
     setCompressionPreset("balanced");
+    setPageSource(null);
+    setPageSelection("");
+    setPagePlan(null);
+    setPagePlanError(null);
 
     try {
       const started = await invoke<ActionInfo>("start_action", {
@@ -391,6 +490,10 @@ export function MenuWindow() {
         setSplitPlan(null);
         setSplitPlanError(null);
         setCompressSource(null);
+        setPageSource(null);
+        setPageSelection("");
+        setPagePlan(null);
+        setPagePlanError(null);
         setConversionResult(null);
         setConversionError(null);
         setResultActionError(null);
@@ -415,6 +518,10 @@ export function MenuWindow() {
       setSplitPlan(null);
       setSplitPlanError(null);
       setCompressSource(null);
+      setPageSource(null);
+      setPageSelection("");
+      setPagePlan(null);
+      setPagePlanError(null);
       setConversionResult(null);
       setConversionError(null);
       setResultActionError(null);
@@ -449,6 +556,10 @@ export function MenuWindow() {
       setSplitPlan(null);
       setSplitPlanError(null);
       setCompressSource(null);
+      setPageSource(null);
+      setPageSelection("");
+      setPagePlan(null);
+      setPagePlanError(null);
       setOutputError(null);
       setConversionResult(null);
       setConversionError(null);
@@ -511,6 +622,16 @@ export function MenuWindow() {
         result = await invoke<ConversionResult>("compress_pdf", {
           preset: compressionPreset,
         });
+      } else if (
+        selectedOperation?.id === "pdf.extract_pages" ||
+        selectedOperation?.id === "pdf.delete_pages"
+      ) {
+        result = await invoke<ConversionResult>(
+          selectedOperation.id === "pdf.extract_pages"
+            ? "extract_pages"
+            : "delete_pages",
+          { selection: pageSelection },
+        );
       } else {
         const command =
           selectedOperation?.id === "pdf.merge"
@@ -547,6 +668,13 @@ export function MenuWindow() {
       setStage("configure");
     } else if (selectedOperation?.id === "pdf.compress") {
       setStage("compression");
+    } else if (
+      selectedOperation?.id === "pdf.extract_pages" ||
+      selectedOperation?.id === "pdf.delete_pages"
+    ) {
+      setOutputInfo(null);
+      setOutputError(null);
+      setStage("pages");
     } else {
       setStage("review");
     }
@@ -609,18 +737,38 @@ export function MenuWindow() {
     selectedOperation !== null &&
     compressSource !== null &&
     inputSelection !== null;
+  const showPages =
+    stage === "pages" &&
+    selectedOperation !== null &&
+    pageSource !== null &&
+    inputSelection !== null;
   const showOutput =
     stage === "output" && selectedOperation !== null && inputSelection !== null;
   const isSplit = selectedOperation?.id === "pdf.split";
   const isMerge = selectedOperation?.id === "pdf.merge";
   const isCompress = selectedOperation?.id === "pdf.compress";
-  const minFiles = isSplit || isCompress ? 1 : isMerge ? 2 : 1;
-  const fileNoun = isSplit || isCompress ? "PDF" : isMerge ? "PDFs" : "images";
+  const isExtractPages = selectedOperation?.id === "pdf.extract_pages";
+  const isDeletePages = selectedOperation?.id === "pdf.delete_pages";
+  const isPageSelection = isExtractPages || isDeletePages;
+  const pageSelectionMode: PageSelectionMode | null = isExtractPages
+    ? "extract"
+    : isDeletePages
+      ? "delete"
+      : null;
+  const minFiles = isSplit || isCompress || isPageSelection ? 1 : isMerge ? 2 : 1;
+  const fileNoun =
+    isSplit || isCompress || isPageSelection
+      ? "PDF"
+      : isMerge
+        ? "PDFs"
+        : "images";
   const continueLabel = isSplit
     ? "Configure split"
     : isCompress
       ? "Choose preset"
-      : undefined;
+      : isPageSelection
+        ? "Choose pages"
+        : undefined;
 
   return (
     <main className="app-shell">
@@ -644,7 +792,13 @@ export function MenuWindow() {
           fileNoun={fileNoun}
           continueLabel={continueLabel}
           isContinuing={
-            isSplit ? isInspectingSplit : isCompress ? isInspectingCompress : false
+            isSplit
+              ? isInspectingSplit
+              : isCompress
+                ? isInspectingCompress
+                : isPageSelection
+                  ? isInspectingPages
+                  : false
           }
           isPicking={isPicking}
           isDropMode={isDropMode}
@@ -663,6 +817,8 @@ export function MenuWindow() {
               void beginSplitSetup();
             } else if (isCompress) {
               void beginCompressionSetup();
+            } else if (isPageSelection) {
+              void beginPageSelectionSetup();
             } else {
               setStage("review");
             }
@@ -731,6 +887,26 @@ export function MenuWindow() {
           onContinue={() => setStage("output")}
           onDismiss={dismiss}
         />
+      ) : showPages ? (
+        <PageSelectionSettings
+          source={pageSource}
+          mode={pageSelectionMode ?? "extract"}
+          selection={pageSelection}
+          plan={pagePlan}
+          isPlanning={isPlanningPages}
+          error={pagePlanError}
+          categoryIcon={selectedAction?.icon}
+          onSelectionChange={(value) => {
+            setPageSelection(value);
+            setIsPlanningPages(true);
+            setPagePlanError(null);
+            setOutputInfo(null);
+            setOutputError(null);
+          }}
+          onBack={() => setStage("input")}
+          onContinue={() => setStage("output")}
+          onDismiss={dismiss}
+        />
       ) : showOutput ? (
         <OutputPanel
           category={selectedAction}
@@ -745,6 +921,8 @@ export function MenuWindow() {
           isCompress={isCompress}
           compressionPreset={compressionPreset}
           compressSource={compressSource}
+          pageSelectionMode={pageSelectionMode}
+          pagePlan={pagePlan}
           splitMode={splitMode}
           splitPlan={splitPlan}
           result={conversionResult}
