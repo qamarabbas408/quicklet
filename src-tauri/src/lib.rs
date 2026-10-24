@@ -230,6 +230,12 @@ fn open_menu(app: AppHandle, x: Option<f64>, y: Option<f64>) -> Result<(), Strin
 }
 
 #[tauri::command]
+fn keep_menu_alive(app: AppHandle) -> Result<(), String> {
+    note_menu_shown(&app);
+    Ok(())
+}
+
+#[tauri::command]
 fn dismiss_menu(app: AppHandle) -> Result<(), String> {
     if app
         .state::<InputState>()
@@ -1923,6 +1929,12 @@ fn note_menu_shown(app: &AppHandle) {
     }
 }
 
+fn should_hide_on_blur(last_shown_at: Option<Instant>, input_busy: bool) -> bool {
+    !input_busy
+        && !last_shown_at
+            .is_some_and(|shown_at| shown_at.elapsed() < BLUR_GRACE_PERIOD)
+}
+
 fn compute_menu_position(
     cursor: (f64, f64),
     window_size: (u32, u32),
@@ -2034,22 +2046,17 @@ fn setup_menu_window(app: &tauri::App) -> tauri::Result<()> {
     window.on_window_event(move |event| match event {
         WindowEvent::Focused(false) => {
             let state = handle.state::<MenuState>();
-            let within_grace_period = state
+            let last_shown_at = state
                 .last_shown_at
                 .lock()
                 .ok()
-                .map(|last_shown_at| {
-                    last_shown_at
-                        .map(|shown_at| shown_at.elapsed() < BLUR_GRACE_PERIOD)
-                        .unwrap_or(true)
-                })
-                .unwrap_or(true);
+                .and_then(|last_shown_at| *last_shown_at);
             let input_state = handle.state::<InputState>();
             let input_busy = input_state.dialog_open.load(Ordering::SeqCst)
                 || input_state.drop_mode.load(Ordering::SeqCst)
                 || input_state.conversion_in_progress.load(Ordering::SeqCst);
 
-            if !input_busy && !within_grace_period {
+            if should_hide_on_blur(last_shown_at, input_busy) {
                 input_state.drop_mode.store(false, Ordering::SeqCst);
                 clear_input_state(&input_state);
 
@@ -2147,6 +2154,7 @@ pub fn run() {
     builder
         .invoke_handler(tauri::generate_handler![
             open_menu,
+            keep_menu_alive,
             dismiss_menu,
             get_menu_status,
             pick_input_files,
@@ -2193,8 +2201,12 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputState, compute_menu_position, ensure_not_converting};
+    use super::{
+        BLUR_GRACE_PERIOD, InputState, compute_menu_position, ensure_not_converting,
+        should_hide_on_blur,
+    };
     use std::sync::atomic::Ordering;
+    use std::time::Instant;
 
     const WINDOW: (u32, u32) = (440, 440);
     const MARGIN: i32 = 8;
@@ -2235,6 +2247,22 @@ mod tests {
         let position = compute_menu_position((100.0, 100.0), WINDOW, (0, 0), (300, 300), MARGIN);
 
         assert_eq!(position, (8, 8));
+    }
+
+    #[test]
+    fn keeps_menu_open_during_interaction_grace_period() {
+        let last_shown_at = Some(Instant::now());
+
+        assert!(!should_hide_on_blur(last_shown_at, false));
+    }
+
+    #[test]
+    fn hides_menu_after_grace_period_expires() {
+        let last_shown_at = Some(
+            Instant::now() - (BLUR_GRACE_PERIOD + std::time::Duration::from_millis(1)),
+        );
+
+        assert!(should_hide_on_blur(last_shown_at, false));
     }
 
     #[test]

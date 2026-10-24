@@ -144,6 +144,11 @@ export function MenuWindow() {
     setIsOpen(false);
   }, [isConverting, resetSession]);
 
+  const keepMenuAlive = useCallback(() => {
+    if (!IS_TAURI) return;
+    void invoke("keep_menu_alive").catch(() => {});
+  }, []);
+
   useEffect(() => {
     if (!IS_TAURI) return;
 
@@ -771,7 +776,11 @@ export function MenuWindow() {
         : undefined;
 
   return (
-    <main className="app-shell">
+    <main
+      className="app-shell"
+      onPointerDown={keepMenuAlive}
+      onPointerMove={keepMenuAlive}
+    >
       {showActions ? (
         <ActionList
           category={selectedAction}
