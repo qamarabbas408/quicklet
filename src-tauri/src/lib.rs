@@ -1,3 +1,4 @@
+pub mod compress;
 pub mod merge;
 pub mod pdf;
 pub mod split;
@@ -73,6 +74,19 @@ struct ConversionFile {
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ConversionCompression {
+    original_bytes: u64,
+    output_bytes: u64,
+    saved_bytes: u64,
+    reduction_percent: f64,
+    preset: String,
+    status: String,
+    images_recompressed: usize,
+    images_skipped: usize,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ConversionResult {
     pages: usize,
     bytes_written: u64,
@@ -80,6 +94,8 @@ struct ConversionResult {
     directory: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     files: Option<Vec<ConversionFile>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compression: Option<ConversionCompression>,
 }
 
 struct ConversionBusyGuard {
@@ -134,6 +150,19 @@ struct SplitSourceInfo {
     bytes: u64,
     max_pages: usize,
     max_outputs: usize,
+    max_input_bytes: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompressSourceInfo {
+    name: String,
+    pages: usize,
+    bytes: u64,
+    has_signature: bool,
+    images: usize,
+    max_pages: usize,
+    max_images: usize,
     max_input_bytes: u64,
 }
 
@@ -547,6 +576,7 @@ async fn convert_to_pdf(app: AppHandle) -> Result<ConversionResult, String> {
         name,
         directory,
         files: None,
+        compression: None,
     })
 }
 
@@ -641,6 +671,7 @@ async fn merge_pdfs(app: AppHandle) -> Result<ConversionResult, String> {
         name,
         directory,
         files: None,
+        compression: None,
     })
 }
 
@@ -844,6 +875,7 @@ async fn split_pdf(
         ),
         directory: output_directory.display().to_string(),
         files: Some(files),
+        compression: None,
     })
 }
 
@@ -868,6 +900,138 @@ fn open_output_directory(app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(directory.to_string_lossy().into_owned(), None::<&str>)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn inspect_compress_source(app: AppHandle) -> Result<CompressSourceInfo, String> {
+    let path = compress_input_path(&app)?;
+    let task_path = path.clone();
+
+    let source = tauri::async_runtime::spawn_blocking(move || compress::inspect_pdf(&task_path))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document.pdf".to_string());
+
+    Ok(CompressSourceInfo {
+        name,
+        pages: source.pages,
+        bytes: source.bytes,
+        has_signature: source.has_signature,
+        images: source.images,
+        max_pages: compress::MAX_COMPRESS_PAGES,
+        max_images: compress::MAX_COMPRESS_IMAGE_OBJECTS,
+        max_input_bytes: compress::MAX_COMPRESS_INPUT_BYTES,
+    })
+}
+
+#[tauri::command]
+async fn compress_pdf(app: AppHandle, preset: String) -> Result<ConversionResult, String> {
+    let (path, output_path, preset) = {
+        let state = app.state::<InputState>();
+        ensure_not_converting(&state)?;
+
+        let action_id = state
+            .action_id
+            .lock()
+            .map(|action_id| action_id.clone())
+            .unwrap_or(None)
+            .ok_or_else(|| "Choose an action first.".to_string())?;
+
+        if action_id != "pdf.compress" {
+            return Err("This action is not available yet.".to_string());
+        }
+
+        let files = state
+            .files
+            .lock()
+            .map(|files| files.clone())
+            .unwrap_or_default();
+
+        if files.len() != 1 {
+            return Err("Select exactly one PDF to compress.".to_string());
+        }
+
+        let output_path = state
+            .output_path
+            .lock()
+            .map(|output| output.clone())
+            .unwrap_or(None)
+            .ok_or_else(|| "Choose an output destination first.".to_string())?;
+
+        let preset = compress::CompressionPreset::parse(&preset)
+            .ok_or_else(|| "Choose a valid compression preset.".to_string())?;
+
+        if state
+            .conversion_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("A conversion is already running.".to_string());
+        }
+
+        (files[0].path.clone(), output_path, preset)
+    };
+
+    let guard_app = app.clone();
+    let task_output = output_path.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ConversionBusyGuard { app: guard_app };
+        compress::compress_pdf_with_overwrite(&path, &task_output, preset)
+    })
+    .await;
+
+    let outcome = match joined {
+        Ok(result) => result.map_err(|error| error.to_string())?,
+        Err(error) => {
+            app.state::<InputState>()
+                .conversion_in_progress
+                .store(false, Ordering::SeqCst);
+            return Err(error.to_string());
+        }
+    };
+
+    if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
+        *last_output = Some(output_path.clone());
+    }
+    if let Ok(mut last_output_directory) = app.state::<InputState>().last_output_directory.lock() {
+        *last_output_directory = None;
+    }
+
+    let name = output_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output.pdf".to_string());
+    let directory = output_path
+        .parent()
+        .map(|directory| directory.display().to_string())
+        .unwrap_or_default();
+    let status = match outcome.status {
+        compress::CompressionStatus::Reduced => "reduced",
+        compress::CompressionStatus::NoReduction => "no-reduction",
+    };
+
+    Ok(ConversionResult {
+        pages: outcome.pages,
+        bytes_written: outcome.output_bytes,
+        name,
+        directory,
+        files: None,
+        compression: Some(ConversionCompression {
+            original_bytes: outcome.original_bytes,
+            output_bytes: outcome.output_bytes,
+            saved_bytes: outcome.saved_bytes,
+            reduction_percent: outcome.reduction_percent,
+            preset: preset.label().to_string(),
+            status: status.to_string(),
+            images_recompressed: outcome.images_recompressed,
+            images_skipped: outcome.images_skipped,
+        }),
+    })
 }
 
 fn last_output_path(state: &InputState) -> Result<PathBuf, String> {
@@ -1228,8 +1392,36 @@ fn split_input_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(files[0].path.clone())
 }
 
+fn compress_input_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let state = app.state::<InputState>();
+    ensure_not_converting(&state)?;
+
+    let action_id = state
+        .action_id
+        .lock()
+        .map(|action_id| action_id.clone())
+        .unwrap_or(None)
+        .ok_or_else(|| "Choose an action first.".to_string())?;
+
+    if action_id != "pdf.compress" {
+        return Err("This action is not available yet.".to_string());
+    }
+
+    let files = state
+        .files
+        .lock()
+        .map(|files| files.clone())
+        .unwrap_or_default();
+
+    if files.len() != 1 {
+        return Err("Select exactly one PDF to compress.".to_string());
+    }
+
+    Ok(files[0].path.clone())
+}
+
 fn max_files_for_action(action_id: &str) -> usize {
-    if action_id == "pdf.split" {
+    if matches!(action_id, "pdf.split" | "pdf.compress") {
         1
     } else {
         MAX_INPUT_FILES
@@ -1239,7 +1431,7 @@ fn max_files_for_action(action_id: &str) -> usize {
 fn action_input_kind(action_id: &str) -> Option<&'static str> {
     match action_id {
         "images.convert_to_pdf" => Some("images"),
-        "pdf.merge" | "pdf.split" => Some("pdf"),
+        "pdf.merge" | "pdf.split" | "pdf.compress" => Some("pdf"),
         _ => None,
     }
 }
@@ -1317,9 +1509,9 @@ fn category_actions(category_id: &str) -> Vec<ActionInfo> {
             ),
             action(
                 "pdf.compress",
-                "Compress",
-                "Reduce PDF file size",
-                false,
+                "Compress PDF",
+                "Reduce PDF file size with lossless or image recompression",
+                true,
                 Some("pdf"),
             ),
             action(
@@ -1773,6 +1965,8 @@ pub fn run() {
             inspect_split_source,
             plan_split,
             split_pdf,
+            inspect_compress_source,
+            compress_pdf,
             reveal_output,
             open_output,
             open_output_directory
@@ -1857,6 +2051,11 @@ mod tests {
             super::filter_for_action("pdf.split").expect("PDF split should have filters");
         assert_eq!(split_name, "PDF documents");
         assert_eq!(split_extensions, &["pdf"]);
+
+        let (compress_name, compress_extensions) =
+            super::filter_for_action("pdf.compress").expect("PDF compress should have filters");
+        assert_eq!(compress_name, "PDF documents");
+        assert_eq!(compress_extensions, &["pdf"]);
 
         assert!(super::filter_for_action("compress.files").is_none());
         assert!(super::filter_for_action("settings.preferences").is_none());
@@ -1962,6 +2161,11 @@ mod tests {
                 .iter()
                 .any(|action| action.id == "pdf.split" && action.enabled)
         );
+        assert!(
+            pdf_actions
+                .iter()
+                .any(|action| action.id == "pdf.compress" && action.enabled)
+        );
     }
 
     #[test]
@@ -1973,12 +2177,24 @@ mod tests {
         std::fs::write(&second, b"x").expect("second PDF should be written");
 
         let state = super::InputState::default();
-        let outcome = super::ingest_paths(&state, "pdf.split", vec![first, second], false);
+        let outcome = super::ingest_paths(
+            &state,
+            "pdf.split",
+            vec![first.clone(), second.clone()],
+            false,
+        );
 
         assert_eq!(outcome.accepted, 1);
         assert_eq!(outcome.selection.files.len(), 1);
         assert_eq!(outcome.selection.limit, 1);
         assert_eq!(outcome.selection.limit_skipped, 1);
+
+        let compress_state = super::InputState::default();
+        let compress_outcome =
+            super::ingest_paths(&compress_state, "pdf.compress", vec![first, second], false);
+        assert_eq!(compress_outcome.accepted, 1);
+        assert_eq!(compress_outcome.selection.limit, 1);
+        assert_eq!(compress_outcome.selection.limit_skipped, 1);
 
         std::fs::remove_dir_all(dir).expect("test directory should be removed");
     }

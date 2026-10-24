@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ActionList } from "./ActionList";
+import { CompressionSettings } from "./CompressionSettings";
 import { FileConfirmation } from "./FileConfirmation";
 import { OutputPanel } from "./OutputPanel";
 import { SplitSettings } from "./SplitSettings";
@@ -9,6 +10,8 @@ import { QuickletMark } from "./icons";
 import { RadialMenu } from "./RadialMenu";
 import type {
   ActionInfo,
+  CompressionPreset,
+  CompressionSourceInfo,
   ConversionResult,
   OutputDirectoryInfo,
   OutputInfo,
@@ -20,7 +23,14 @@ import type {
 import { APP_NAME, IS_TAURI } from "../lib/constants";
 import type { InputSelection } from "../lib/input";
 
-type Stage = "radial" | "actions" | "input" | "review" | "configure" | "output";
+type Stage =
+  | "radial"
+  | "actions"
+  | "input"
+  | "review"
+  | "configure"
+  | "compression"
+  | "output";
 
 type DragState = {
   active: boolean;
@@ -61,6 +71,11 @@ export function MenuWindow() {
   const [isPlanning, setIsPlanning] = useState(false);
   const [outputDirectory, setOutputDirectory] =
     useState<OutputDirectoryInfo | null>(null);
+  const [isInspectingCompress, setIsInspectingCompress] = useState(false);
+  const [compressSource, setCompressSource] =
+    useState<CompressionSourceInfo | null>(null);
+  const [compressionPreset, setCompressionPreset] =
+    useState<CompressionPreset>("balanced");
   const [pickerError, setPickerError] = useState<string | null>(null);
   const [isDropMode, setIsDropMode] = useState(false);
   const [isDragActive, setIsDragActive] = useState(false);
@@ -91,6 +106,9 @@ export function MenuWindow() {
     setSplitPlanError(null);
     setIsPlanning(false);
     setOutputDirectory(null);
+    setIsInspectingCompress(false);
+    setCompressSource(null);
+    setCompressionPreset("balanced");
     setIsDropMode(false);
     setIsDragActive(false);
     setDragCount(0);
@@ -152,6 +170,9 @@ export function MenuWindow() {
       listen<InputSelection>("input-updated", (event) => {
         setInputSelection(event.payload);
         setOutputInfo(null);
+        setOutputDirectory(null);
+        setCompressSource(null);
+        setConversionResult(null);
         setStage("input");
         setIsDropMode(false);
         setIsDragActive(false);
@@ -227,6 +248,44 @@ export function MenuWindow() {
     }
   }, [isInspectingSplit]);
 
+  const beginCompressionSetup = useCallback(async () => {
+    if (isInspectingCompress) return;
+
+    setIsInspectingCompress(true);
+    setPickerError(null);
+    setCompressSource(null);
+
+    try {
+      const before = await invoke<InputSelection>("get_input");
+      const source = await invoke<CompressionSourceInfo>(
+        "inspect_compress_source",
+      );
+      const after = await invoke<InputSelection>("get_input");
+
+      if (
+        after.files.length !== 1 ||
+        before.files[0]?.id !== after.files[0]?.id
+      ) {
+        setInputSelection(after);
+        setStage("input");
+        return;
+      }
+
+      setCompressSource(source);
+      setCompressionPreset("balanced");
+      setOutputInfo(null);
+      setOutputError(null);
+      setConversionResult(null);
+      setConversionError(null);
+      setResultActionError(null);
+      setStage("compression");
+    } catch (error) {
+      setPickerError(String(error));
+    } finally {
+      setIsInspectingCompress(false);
+    }
+  }, [isInspectingCompress]);
+
   useEffect(() => {
     if (stage !== "configure" || splitSource === null) return;
 
@@ -293,6 +352,8 @@ export function MenuWindow() {
     setSplitPlan(null);
     setSplitPlanError(null);
     setOutputDirectory(null);
+    setCompressSource(null);
+    setCompressionPreset("balanced");
 
     try {
       const started = await invoke<ActionInfo>("start_action", {
@@ -329,6 +390,7 @@ export function MenuWindow() {
         setSplitSource(null);
         setSplitPlan(null);
         setSplitPlanError(null);
+        setCompressSource(null);
         setConversionResult(null);
         setConversionError(null);
         setResultActionError(null);
@@ -352,6 +414,7 @@ export function MenuWindow() {
       setSplitSource(null);
       setSplitPlan(null);
       setSplitPlanError(null);
+      setCompressSource(null);
       setConversionResult(null);
       setConversionError(null);
       setResultActionError(null);
@@ -385,6 +448,7 @@ export function MenuWindow() {
       setSplitSource(null);
       setSplitPlan(null);
       setSplitPlanError(null);
+      setCompressSource(null);
       setOutputError(null);
       setConversionResult(null);
       setConversionError(null);
@@ -438,6 +502,10 @@ export function MenuWindow() {
           mode: splitMode,
           ranges: splitMode === "ranges" ? splitRanges : "",
         });
+      } else if (selectedOperation?.id === "pdf.compress") {
+        result = await invoke<ConversionResult>("compress_pdf", {
+          preset: compressionPreset,
+        });
       } else {
         const command =
           selectedOperation?.id === "pdf.merge"
@@ -470,7 +538,13 @@ export function MenuWindow() {
     setConversionResult(null);
     setConversionError(null);
     setResultActionError(null);
-    setStage(selectedOperation?.id === "pdf.split" ? "configure" : "review");
+    if (selectedOperation?.id === "pdf.split") {
+      setStage("configure");
+    } else if (selectedOperation?.id === "pdf.compress") {
+      setStage("compression");
+    } else {
+      setStage("review");
+    }
   };
 
   const enterDropMode = async () => {
@@ -525,12 +599,23 @@ export function MenuWindow() {
     selectedOperation !== null &&
     splitSource !== null &&
     inputSelection !== null;
+  const showCompression =
+    stage === "compression" &&
+    selectedOperation !== null &&
+    compressSource !== null &&
+    inputSelection !== null;
   const showOutput =
     stage === "output" && selectedOperation !== null && inputSelection !== null;
   const isSplit = selectedOperation?.id === "pdf.split";
   const isMerge = selectedOperation?.id === "pdf.merge";
-  const minFiles = isSplit ? 1 : isMerge ? 2 : 1;
-  const fileNoun = isSplit ? "PDF" : isMerge ? "PDFs" : "images";
+  const isCompress = selectedOperation?.id === "pdf.compress";
+  const minFiles = isSplit || isCompress ? 1 : isMerge ? 2 : 1;
+  const fileNoun = isSplit || isCompress ? "PDF" : isMerge ? "PDFs" : "images";
+  const continueLabel = isSplit
+    ? "Configure split"
+    : isCompress
+      ? "Choose preset"
+      : undefined;
 
   return (
     <main className="app-shell">
@@ -552,8 +637,10 @@ export function MenuWindow() {
           mode="input"
           minFiles={minFiles}
           fileNoun={fileNoun}
-          continueLabel={isSplit ? "Configure split" : undefined}
-          isContinuing={isSplit ? isInspectingSplit : false}
+          continueLabel={continueLabel}
+          isContinuing={
+            isSplit ? isInspectingSplit : isCompress ? isInspectingCompress : false
+          }
           isPicking={isPicking}
           isDropMode={isDropMode}
           isDragActive={isDragActive}
@@ -569,6 +656,8 @@ export function MenuWindow() {
           onContinue={() => {
             if (isSplit) {
               void beginSplitSetup();
+            } else if (isCompress) {
+              void beginCompressionSetup();
             } else {
               setStage("review");
             }
@@ -623,6 +712,16 @@ export function MenuWindow() {
           onContinue={() => setStage("output")}
           onDismiss={dismiss}
         />
+      ) : showCompression ? (
+        <CompressionSettings
+          source={compressSource}
+          preset={compressionPreset}
+          categoryIcon={selectedAction?.icon}
+          onPresetChange={setCompressionPreset}
+          onBack={() => setStage("input")}
+          onContinue={() => setStage("output")}
+          onDismiss={dismiss}
+        />
       ) : showOutput ? (
         <OutputPanel
           category={selectedAction}
@@ -634,6 +733,9 @@ export function MenuWindow() {
           isConverting={isConverting}
           isMerge={isMerge}
           isSplit={isSplit}
+          isCompress={isCompress}
+          compressionPreset={compressionPreset}
+          compressSource={compressSource}
           splitMode={splitMode}
           splitPlan={splitPlan}
           result={conversionResult}

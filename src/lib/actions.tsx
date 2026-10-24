@@ -71,10 +71,35 @@ export type ConversionFile = {
   bytesWritten: number;
 };
 
+export type CompressionPreset = "light" | "balanced" | "strong";
+
+export type CompressionSourceInfo = {
+  name: string;
+  pages: number;
+  bytes: number;
+  hasSignature: boolean;
+  images: number;
+  maxPages: number;
+  maxImages: number;
+  maxInputBytes: number;
+};
+
+export type CompressionReport = {
+  originalBytes: number;
+  outputBytes: number;
+  savedBytes: number;
+  reductionPercent: number;
+  preset: string;
+  status: "reduced" | "no-reduction";
+  imagesRecompressed: number;
+  imagesSkipped: number;
+};
+
 export type ConversionResult = {
   pages: number;
   bytesWritten: number;
   name: string;
   directory: string;
   files?: ConversionFile[];
+  compression?: CompressionReport;
 };

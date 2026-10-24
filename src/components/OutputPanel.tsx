@@ -1,4 +1,6 @@
 import type {
+  CompressionPreset,
+  CompressionSourceInfo,
   ConversionResult,
   OutputDirectoryInfo,
   OutputInfo,
@@ -19,6 +21,9 @@ type OutputPanelProps = {
   isConverting: boolean;
   isMerge: boolean;
   isSplit: boolean;
+  isCompress: boolean;
+  compressionPreset: CompressionPreset;
+  compressSource: CompressionSourceInfo | null;
   splitMode: SplitMode;
   splitPlan: SplitPlan | null;
   result: ConversionResult | null;
@@ -43,6 +48,9 @@ export function OutputPanel({
   isConverting,
   isMerge,
   isSplit,
+  isCompress,
+  compressionPreset,
+  compressSource,
   splitMode,
   splitPlan,
   result,
@@ -62,6 +70,7 @@ export function OutputPanel({
     : "Show in folder";
   const files = result?.files ?? [];
   const hasFileList = files.length > 0;
+  const compression = result?.compression;
   const canConvert = isSplit
     ? outputDirectory !== null && splitPlan !== null && !isChoosing && !isConverting
     : output !== null && !isChoosing && !isConverting;
@@ -73,17 +82,29 @@ export function OutputPanel({
     ? "Splitting PDF…"
     : isMerge
       ? "Merging PDFs…"
-      : "Creating PDF…";
+      : isCompress
+        ? "Compressing PDF…"
+        : "Creating PDF…";
   const actionLabelForButton = isSplit
     ? "Split PDF"
     : isMerge
       ? "Merge PDFs"
-      : "Convert to PDF";
+      : isCompress
+        ? "Compress PDF"
+        : "Convert to PDF";
   const retryLabel = isSplit
     ? "Retry split"
     : isMerge
       ? "Retry merge"
-      : "Retry conversion";
+      : isCompress
+        ? "Retry compression"
+        : "Retry conversion";
+  const presetLabel = (preset: CompressionPreset) =>
+    preset === "light"
+      ? "Light"
+      : preset === "strong"
+        ? "Strong"
+        : "Balanced";
 
   return (
     <div
@@ -120,11 +141,13 @@ export function OutputPanel({
               className="truncate text-sm font-semibold text-white"
             >
               {result
-                ? hasFileList
-                  ? files.length === 1
-                    ? "PDF created"
-                    : "PDFs created"
-                  : "PDF created"
+                ? isCompress
+                  ? "Compression complete"
+                  : hasFileList
+                    ? files.length === 1
+                      ? "PDF created"
+                      : "PDFs created"
+                    : "PDF created"
                 : "Output"}
             </h2>
             <p className="mt-0.5 text-[11px] text-white/45">{actionLabel}</p>
@@ -182,6 +205,71 @@ export function OutputPanel({
               </div>
             )}
 
+            {compression && (
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Original</span>
+                  <span className="text-white/85">
+                    {formatBytes(compression.originalBytes)}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Output</span>
+                  <span className="text-white/85">
+                    {formatBytes(compression.outputBytes)}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Saved</span>
+                  <span className="text-white/85">
+                    {formatBytes(compression.savedBytes)}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Reduction</span>
+                  <span
+                    className={
+                      compression.reductionPercent > 0
+                        ? "text-emerald-200/90"
+                        : "text-amber-200/85"
+                    }
+                  >
+                    {compression.reductionPercent.toFixed(1)}%
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Preset</span>
+                  <span className="text-white/85">{compression.preset}</span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Images recompressed</span>
+                  <span className="text-white/85">
+                    {compression.imagesRecompressed}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-start justify-between gap-3 text-[11px]">
+                  <span className="shrink-0 text-white/45">Status</span>
+                  <span
+                    className={`text-right ${
+                      compression.status === "reduced"
+                        ? "text-emerald-200/90"
+                        : "text-amber-200/85"
+                    }`}
+                  >
+                    {compression.status === "reduced"
+                      ? "Reduced"
+                      : "No reduction — original retained"}
+                  </span>
+                </div>
+                {compression.status === "no-reduction" && (
+                  <p className="mt-2 text-[10px] text-white/35">
+                    The compressed candidate was not smaller, so the exact
+                    original bytes were written to the destination.
+                  </p>
+                )}
+              </div>
+            )}
+
             {resultError && (
               <p
                 role="alert"
@@ -208,7 +296,38 @@ export function OutputPanel({
           </>
         ) : (
           <>
-            {isSplit ? (
+            {isCompress ? (
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Format</span>
+                  <span className="text-white/85">PDF</span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Pages</span>
+                  <span className="text-white/85">
+                    {compressSource?.pages ?? "—"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Preset</span>
+                  <span className="text-white/85">
+                    {presetLabel(compressionPreset)}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Original size</span>
+                  <span className="text-white/85">
+                    {compressSource ? formatBytes(compressSource.bytes) : "—"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Images detected</span>
+                  <span className="text-white/85">
+                    {compressSource?.images ?? "—"}
+                  </span>
+                </div>
+              </div>
+            ) : isSplit ? (
               <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
                 <div className="flex items-center justify-between text-[11px]">
                   <span className="text-white/45">Format</span>
@@ -329,7 +448,9 @@ export function OutputPanel({
               onClick={onChooseOutput}
             >
               {isChoosing
-                ? "Choosing folder…"
+                ? isSplit
+                  ? "Choosing folder…"
+                  : "Choosing destination…"
                 : isSplit
                   ? outputDirectory
                     ? "Change output folder"
@@ -361,7 +482,12 @@ export function OutputPanel({
             disabled={isConverting}
             onClick={onBack}
           >
-            &larr; {isSplit ? "Split settings" : "Review files"}
+            &larr;{" "}
+            {isSplit
+              ? "Split settings"
+              : isCompress
+                ? "Compression settings"
+                : "Review files"}
           </button>
           <span className="text-white/30">Esc to dismiss</span>
         </div>
