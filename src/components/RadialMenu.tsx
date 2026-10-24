@@ -1,5 +1,4 @@
 import { actions, type RadialAction } from "../lib/actions";
-import { APP_NAME } from "../lib/constants";
 import { QuickletMark } from "./icons";
 import { RadialMenuItem } from "./RadialMenuItem";
 
@@ -30,8 +29,7 @@ export function RadialMenu({
           title="Drag to move Quicklet"
           aria-hidden="true"
         >
-          <QuickletMark className="pointer-events-none h-5 w-5" />
-          <span className="pointer-events-none">{APP_NAME}</span>
+          <QuickletMark className="pointer-events-none h-14 w-14" />
         </div>
 
         {actions.map((action, index) => (
