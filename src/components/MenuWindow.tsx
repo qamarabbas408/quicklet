@@ -6,6 +6,7 @@ import { CompressionSettings } from "./CompressionSettings";
 import { FileConfirmation } from "./FileConfirmation";
 import { OutputPanel } from "./OutputPanel";
 import { PageSelectionSettings } from "./PageSelectionSettings";
+import { SettingsPanel, type SettingsState } from "./SettingsPanel";
 import { SplitSettings } from "./SplitSettings";
 import { QuickletMark } from "./icons";
 import { RadialMenu } from "./RadialMenu";
@@ -30,6 +31,7 @@ import type { InputSelection } from "../lib/input";
 type Stage =
   | "radial"
   | "actions"
+  | "settings"
   | "input"
   | "review"
   | "configure"
@@ -91,6 +93,25 @@ export function MenuWindow() {
   const [isDropMode, setIsDropMode] = useState(false);
   const [isDragActive, setIsDragActive] = useState(false);
   const [dragCount, setDragCount] = useState(0);
+  const [settingsState, setSettingsState] = useState<SettingsState | null>(null);
+  const [settingsLoading, setSettingsLoading] = useState(false);
+
+  const loadSettings = useCallback(async () => {
+    setSettingsLoading(true);
+
+    try {
+      const nextSettings = await invoke<SettingsState>("get_settings");
+      setSettingsState(nextSettings);
+    } catch (error) {
+      setSettingsState({
+        defaultOutputDirectory: null,
+        valid: false,
+        error: String(error),
+      });
+    } finally {
+      setSettingsLoading(false);
+    }
+  }, []);
 
   const resetSession = useCallback(() => {
     setStage("radial");
@@ -129,6 +150,7 @@ export function MenuWindow() {
     setIsDropMode(false);
     setIsDragActive(false);
     setDragCount(0);
+    setSettingsState(null);
   }, []);
 
   const dismiss = useCallback(() => {
@@ -463,6 +485,14 @@ export function MenuWindow() {
       const started = await invoke<ActionInfo>("start_action", {
         actionId: action.id,
       });
+
+      if (started.id === "settings.preferences") {
+        setSelectedOperation(started);
+        setInputSelection(null);
+        setStage("settings");
+        return;
+      }
+
       const selection = await invoke<InputSelection>("get_input");
 
       if (selectedOperation?.id !== started.id) {
@@ -728,6 +758,7 @@ export function MenuWindow() {
   };
 
   const showActions = stage === "actions" && selectedAction !== null;
+  const showSettings = stage === "settings";
   const showInput =
     stage === "input" && selectedOperation !== null && inputSelection !== null;
   const showReview =
@@ -775,13 +806,43 @@ export function MenuWindow() {
         ? "Choose pages"
         : undefined;
 
+  useEffect(() => {
+    if (stage === "settings") {
+      void loadSettings();
+    }
+  }, [stage, loadSettings]);
+
   return (
     <main
       className="app-shell"
       onPointerDown={keepMenuAlive}
       onPointerMove={keepMenuAlive}
     >
-      {showActions ? (
+      {showSettings ? (
+        <SettingsPanel
+          settings={settingsState}
+          loading={settingsLoading}
+          onBack={() => setStage("actions")}
+          onDismiss={dismiss}
+          onChooseDirectory={() => {
+            void invoke<SettingsState>("choose_preferred_output_directory").then((nextSettings) => {
+              setSettingsState(nextSettings);
+            });
+          }}
+          onClearDirectory={() => {
+            void invoke<SettingsState>("update_default_output_directory", { directory: null }).then((nextSettings) => {
+              setSettingsState(nextSettings);
+            });
+          }}
+          onReset={() => {
+            const confirmed = window.confirm("Reset Quicklet settings to defaults?");
+            if (!confirmed) return;
+            void invoke<SettingsState>("reset_settings").then((nextSettings) => {
+              setSettingsState(nextSettings);
+            });
+          }}
+        />
+      ) : showActions ? (
         <ActionList
           category={selectedAction}
           actions={actions}

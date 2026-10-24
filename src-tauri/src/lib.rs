@@ -66,6 +66,32 @@ struct InputState {
     conversion_in_progress: AtomicBool,
 }
 
+const SETTINGS_FILE_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AppPreferences {
+    version: u32,
+    default_output_directory: Option<String>,
+}
+
+impl Default for AppPreferences {
+    fn default() -> Self {
+        Self {
+            version: SETTINGS_FILE_VERSION,
+            default_output_directory: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SettingsState {
+    default_output_directory: Option<String>,
+    valid: bool,
+    error: Option<String>,
+}
+
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConversionFile {
@@ -222,6 +248,201 @@ fn menu_shortcut() -> Shortcut {
     let modifiers = Modifiers::CONTROL | Modifiers::SHIFT;
 
     Shortcut::new(Some(modifiers), Code::Space)
+}
+
+fn settings_path_for(config_dir: &std::path::Path) -> Result<PathBuf, String> {
+    let directory = config_dir.join("quicklet");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("Unable to create settings directory: {error}"))?;
+    Ok(directory.join("settings.json"))
+}
+
+fn validate_writable_directory(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(
+            "The preferred output folder does not exist or is unavailable. Choose another folder or clear this preference."
+                .to_string(),
+        );
+    }
+    if !path.is_dir() {
+        return Err(
+            "The preferred output folder is not a valid folder. Choose another folder or clear this preference."
+                .to_string(),
+        );
+    }
+
+    let probe = path.join(".quicklet-settings-check");
+    match std::fs::File::create(&probe) {
+        Ok(file) => {
+            drop(file);
+            std::fs::remove_file(&probe).map_err(|error| {
+                format!("Unable to remove the write-test file in the preferred folder: {error}")
+            })?;
+            Ok(())
+        }
+        Err(error) => Err(format!(
+            "The preferred output folder is not writable: {error}. Choose another folder or clear this preference."
+        )),
+    }
+}
+
+fn normalized_preferred_directory(path: Option<String>) -> Result<Option<PathBuf>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let directory = PathBuf::from(trimmed);
+    validate_writable_directory(&directory)?;
+    Ok(Some(directory))
+}
+
+fn default_preferences() -> AppPreferences {
+    AppPreferences::default()
+}
+
+fn write_preferences_to(config_dir: &std::path::Path, preferences: &AppPreferences) -> Result<(), String> {
+    let path = settings_path_for(config_dir)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "Settings path is missing a parent directory.".to_string())?;
+    let temp_path = directory.join("settings.json.tmp");
+    let serialized = serde_json::to_vec_pretty(preferences)
+        .map_err(|error| format!("Unable to serialize settings: {error}"))?;
+    std::fs::write(&temp_path, &serialized)
+        .map_err(|error| format!("Unable to write temporary settings file: {error}"))?;
+    let _ = std::fs::remove_file(&path);
+    std::fs::rename(&temp_path, &path)
+        .map_err(|error| format!("Unable to write settings file: {error}"))?;
+    Ok(())
+}
+
+fn write_preferences(app: &AppHandle, preferences: &AppPreferences) -> Result<(), String> {
+    let directory = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("Unable to locate application config directory: {error}"))?;
+    write_preferences_to(&directory, preferences)
+}
+
+fn load_preferences_from(config_dir: &std::path::Path) -> Result<AppPreferences, String> {
+    let path = settings_path_for(config_dir)?;
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(default_preferences());
+        }
+        Err(error) => {
+            return Err(format!("Unable to read settings file: {error}"));
+        }
+    };
+
+    let preferences = match serde_json::from_str::<AppPreferences>(&contents) {
+        Ok(preferences) => preferences,
+        Err(_) => default_preferences(),
+    };
+
+    if preferences.version != SETTINGS_FILE_VERSION {
+        return Ok(default_preferences());
+    }
+
+    Ok(preferences)
+}
+
+fn load_preferences(app: &AppHandle) -> Result<AppPreferences, String> {
+    let directory = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("Unable to locate application config directory: {error}"))?;
+    load_preferences_from(&directory)
+}
+
+fn settings_snapshot_for(config_dir: &std::path::Path) -> Result<SettingsState, String> {
+    let preferences = load_preferences_from(config_dir)?;
+    let default_output_directory = preferences.default_output_directory.clone();
+    let error = match default_output_directory.as_ref() {
+        Some(directory) => match normalized_preferred_directory(Some(directory.clone())) {
+            Ok(Some(_)) => None,
+            Ok(None) => None,
+            Err(error) => Some(error),
+        },
+        None => None,
+    };
+
+    Ok(SettingsState {
+        default_output_directory,
+        valid: error.is_none(),
+        error,
+    })
+}
+
+fn settings_snapshot(app: &AppHandle) -> Result<SettingsState, String> {
+    let directory = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("Unable to locate application config directory: {error}"))?;
+    settings_snapshot_for(&directory)
+}
+
+#[tauri::command]
+fn get_settings(app: AppHandle) -> Result<SettingsState, String> {
+    settings_snapshot(&app)
+}
+
+#[tauri::command]
+fn update_default_output_directory(app: AppHandle, directory: Option<String>) -> Result<SettingsState, String> {
+    let normalized = normalized_preferred_directory(directory.clone())?;
+    let mut preferences = load_preferences(&app)?;
+    preferences.default_output_directory = normalized.map(|path| path.display().to_string());
+    write_preferences(&app, &preferences)?;
+    settings_snapshot(&app)
+}
+
+#[tauri::command]
+fn reset_settings(app: AppHandle) -> Result<SettingsState, String> {
+    let preferences = default_preferences();
+    write_preferences(&app, &preferences)?;
+    settings_snapshot(&app)
+}
+
+#[tauri::command]
+async fn choose_preferred_output_directory(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<SettingsState, String> {
+    app.state::<InputState>()
+        .dialog_open
+        .store(true, Ordering::SeqCst);
+
+    let dialog = app
+        .dialog()
+        .file()
+        .set_title("Choose preferred output folder")
+        .set_parent(&window);
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    dialog.pick_folder(move |path| {
+        let _ = sender.send(path);
+    });
+
+    let received =
+        tauri::async_runtime::spawn_blocking(move || receiver.recv().ok().flatten()).await;
+
+    app.state::<InputState>()
+        .dialog_open
+        .store(false, Ordering::SeqCst);
+    note_menu_shown(&app);
+
+    let picked = received.map_err(|error| error.to_string())?;
+    let Some(folder) = picked else {
+        return get_settings(app);
+    };
+
+    let path = folder.into_path().map_err(|error| error.to_string())?;
+    update_default_output_directory(app, Some(path.display().to_string()))
 }
 
 #[tauri::command]
@@ -475,13 +696,20 @@ async fn choose_output(
 
     state.dialog_open.store(true, Ordering::SeqCst);
 
-    let dialog = app
-        .dialog()
-        .file()
-        .set_title("Save PDF")
-        .set_parent(&window)
-        .add_filter("PDF", &["pdf"])
-        .set_file_name(default_name);
+    let dialog = {
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title("Save PDF")
+            .set_parent(&window)
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(default_name);
+
+        if let Ok(Some(directory)) = preferred_output_directory(&app) {
+            dialog = dialog.set_directory(directory);
+        }
+        dialog
+    };
 
     let (sender, receiver) = std::sync::mpsc::channel();
     dialog.save_file(move |path| {
@@ -769,11 +997,18 @@ async fn choose_output_directory(
 
     state.dialog_open.store(true, Ordering::SeqCst);
 
-    let dialog = app
-        .dialog()
-        .file()
-        .set_title("Choose output folder")
-        .set_parent(&window);
+    let dialog = {
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title("Choose output folder")
+            .set_parent(&window);
+
+        if let Ok(Some(directory)) = preferred_output_directory(&app) {
+            dialog = dialog.set_directory(directory);
+        }
+        dialog
+    };
 
     let (sender, receiver) = std::sync::mpsc::channel();
     dialog.pick_folder(move |path| {
@@ -917,6 +1152,15 @@ async fn split_pdf(
         files: Some(files),
         compression: None,
     })
+}
+
+#[tauri::command]
+fn preferred_output_directory(app: &AppHandle) -> Result<Option<PathBuf>, String> {
+    let preferences = load_preferences(app)?;
+    match preferences.default_output_directory {
+        Some(directory) => normalized_preferred_directory(Some(directory)),
+        None => Ok(None),
+    }
 }
 
 #[tauri::command]
@@ -1770,8 +2014,8 @@ fn category_actions(category_id: &str) -> Vec<ActionInfo> {
             action(
                 "settings.preferences",
                 "Preferences",
-                "Appearance and behavior",
-                false,
+                "Output location and defaults",
+                true,
                 None,
             ),
             action(
@@ -1930,9 +2174,7 @@ fn note_menu_shown(app: &AppHandle) {
 }
 
 fn should_hide_on_blur(last_shown_at: Option<Instant>, input_busy: bool) -> bool {
-    !input_busy
-        && !last_shown_at
-            .is_some_and(|shown_at| shown_at.elapsed() < BLUR_GRACE_PERIOD)
+    !input_busy && last_shown_at.is_none_or(|shown_at| shown_at.elapsed() >= BLUR_GRACE_PERIOD)
 }
 
 fn compute_menu_position(
@@ -2155,6 +2397,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_menu,
             keep_menu_alive,
+            get_settings,
+            update_default_output_directory,
+            reset_settings,
+            choose_preferred_output_directory,
             dismiss_menu,
             get_menu_status,
             pick_input_files,
@@ -2202,8 +2448,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLUR_GRACE_PERIOD, InputState, compute_menu_position, ensure_not_converting,
-        should_hide_on_blur,
+        AppPreferences, BLUR_GRACE_PERIOD, InputState, SETTINGS_FILE_VERSION,
+        compute_menu_position, default_preferences, ensure_not_converting,
+        load_preferences_from, normalized_preferred_directory, settings_snapshot_for,
+        settings_path_for, should_hide_on_blur, write_preferences_to,
     };
     use std::sync::atomic::Ordering;
     use std::time::Instant;
@@ -2509,5 +2757,129 @@ mod tests {
         assert_eq!(second.selection.duplicates, 1);
 
         std::fs::remove_dir_all(dir).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn settings_default_to_blank_preferences() {
+        let dir = test_dir("settings-defaults");
+        let preferences = load_preferences_from(&dir).expect("defaults should be ready");
+
+        assert_eq!(preferences, default_preferences());
+        assert!(preferences.default_output_directory.is_none());
+
+        std::fs::remove_dir_all(dir).expect("temporary test directory should be removed");
+    }
+
+    #[test]
+    fn settings_persist_and_reload() {
+        let dir = test_dir("settings-persist");
+        let folder = dir.join("output");
+        std::fs::create_dir_all(&folder).expect("output directory should be created");
+
+        let preferences = AppPreferences {
+            version: SETTINGS_FILE_VERSION,
+            default_output_directory: Some(folder.display().to_string()),
+        };
+        write_preferences_to(&dir, &preferences).expect("preferences should be written");
+
+        let reloaded = load_preferences_from(&dir).expect("preferences should reload");
+        assert_eq!(reloaded, preferences);
+        assert_eq!(
+            settings_snapshot_for(&dir)
+                .expect("settings snapshot should load")
+                .default_output_directory,
+            Some(folder.display().to_string())
+        );
+
+        std::fs::remove_dir_all(dir).expect("temporary test directory should be removed");
+    }
+
+    #[test]
+    fn settings_reject_malformed_or_outdated_file() {
+        let dir = test_dir("settings-malformed");
+        let config = settings_path_for(&dir).expect("settings path should be created");
+        std::fs::write(&config, b"{not valid json}").expect("malformed file should be written");
+
+        let malformed = load_preferences_from(&dir).expect("malformed settings should fall back");
+        assert_eq!(malformed, default_preferences());
+
+        std::fs::write(&config, b"{\"version\": 99, \"defaultOutputDirectory\": \"C:/temp\"}")
+            .expect("outdated settings should be written");
+        let outdated = load_preferences_from(&dir).expect("outdated settings should reset");
+        assert_eq!(outdated, default_preferences());
+
+        std::fs::remove_dir_all(dir).expect("temporary test directory should be removed");
+    }
+
+    #[test]
+    fn settings_reset_to_default_preferences() {
+        let dir = test_dir("settings-reset");
+        let folder = dir.join("output");
+        std::fs::create_dir_all(&folder).expect("output directory should be created");
+
+        let preferences = AppPreferences {
+            version: SETTINGS_FILE_VERSION,
+            default_output_directory: Some(folder.display().to_string()),
+        };
+        write_preferences_to(&dir, &preferences).expect("preferences should be written");
+        write_preferences_to(&dir, &default_preferences()).expect("reset should write defaults");
+
+        let reloaded = load_preferences_from(&dir).expect("reset settings should reload");
+        assert_eq!(reloaded, default_preferences());
+
+        std::fs::remove_dir_all(dir).expect("temporary test directory should be removed");
+    }
+
+    #[test]
+    fn settings_surface_unavailable_directory_errors() {
+        let dir = test_dir("settings-unavailable");
+        let missing = dir.join("missing-folder");
+
+        let invalid = AppPreferences {
+            version: SETTINGS_FILE_VERSION,
+            default_output_directory: Some(missing.display().to_string()),
+        };
+        write_preferences_to(&dir, &invalid).expect("invalid preference should be saved");
+
+        let snapshot = settings_snapshot_for(&dir).expect("invalid setting should be readable");
+        assert!(!snapshot.valid);
+        assert_eq!(snapshot.default_output_directory, Some(missing.display().to_string()));
+        assert!(snapshot
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("does not exist") || snapshot
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not a valid folder") || snapshot
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not writable"));
+
+        let rejected = normalized_preferred_directory(Some(missing.display().to_string()));
+        assert!(rejected.is_err());
+
+        std::fs::remove_dir_all(dir).expect("temporary test directory should be removed");
+    }
+
+    #[test]
+    fn settings_persistence_failures_are_reported() {
+        let dir = test_dir("settings-persistence-failure");
+        let reserved = dir.join("reserved");
+        std::fs::write(&reserved, b"not-a-directory").expect("reserved path should be created");
+
+        let fail_result = write_preferences_to(&reserved, &default_preferences());
+        assert!(fail_result.is_err());
+        let error = fail_result.expect_err("write should fail for a file path");
+        assert!(error.contains("Unable to create settings directory")
+            || error.contains("Unable to write temporary settings file")
+            || error.contains("Unable to write settings file"));
+
+        let fail_read = load_preferences_from(&reserved);
+        assert!(fail_read.is_err());
+
+        std::fs::remove_dir_all(dir).expect("temporary test directory should be removed");
     }
 }
