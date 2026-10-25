@@ -3,6 +3,8 @@ pub mod merge;
 pub mod naming;
 pub mod organize;
 pub mod pdf;
+pub mod pdf_preview;
+pub mod rotate;
 pub mod split;
 
 use chrono::Local;
@@ -176,6 +178,18 @@ struct PageSourceInfo {
     bytes: u64,
     max_pages: usize,
     max_ranges: usize,
+    max_input_bytes: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateSourceInfo {
+    name: String,
+    pages: usize,
+    bytes: u64,
+    rotations: Vec<u16>,
+    has_signature: bool,
+    max_pages: usize,
     max_input_bytes: u64,
 }
 
@@ -1231,6 +1245,180 @@ fn page_selection_input_path(app: &AppHandle) -> Result<(String, PathBuf), Strin
     Ok((action_id, files[0].path.clone()))
 }
 
+#[tauri::command]
+async fn render_pdf_thumbnails(
+    app: AppHandle,
+    requests: Vec<pdf_preview::ThumbnailRequest>,
+    target_width: u32,
+    target_height: u32,
+) -> Result<pdf_preview::PreviewBatch, String> {
+    let state = app.state::<InputState>();
+    ensure_not_converting(&state)?;
+    let files = state
+        .files
+        .lock()
+        .map(|files| files.clone())
+        .unwrap_or_default();
+
+    if files.len() != 1 {
+        return Err("Select exactly one PDF to preview.".to_string());
+    }
+
+    let path = files[0].path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        pdf_preview::render_thumbnails(&path, &requests, target_width, target_height)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn inspect_rotate_source(app: AppHandle) -> Result<RotateSourceInfo, String> {
+    let (_, path) = rotate_input_path(&app)?;
+    let task_path = path.clone();
+
+    let source = tauri::async_runtime::spawn_blocking(move || rotate::inspect_pdf(&task_path))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document.pdf".to_string());
+
+    Ok(RotateSourceInfo {
+        name,
+        pages: source.pages,
+        bytes: source.bytes,
+        rotations: source.rotations,
+        has_signature: source.has_signature,
+        max_pages: rotate::MAX_ROTATE_PAGES,
+        max_input_bytes: rotate::MAX_ROTATE_INPUT_BYTES,
+    })
+}
+
+#[tauri::command]
+async fn rotate_pages(
+    app: AppHandle,
+    rotations: Vec<rotate::PageRotation>,
+) -> Result<ConversionResult, String> {
+    let (path, output_path) = {
+        let state = app.state::<InputState>();
+        ensure_not_converting(&state)?;
+
+        let action_id = state
+            .action_id
+            .lock()
+            .map(|action_id| action_id.clone())
+            .unwrap_or(None)
+            .ok_or_else(|| "Choose an action first.".to_string())?;
+
+        if action_id != "pdf.rotate_pages" {
+            return Err("This action is not available yet.".to_string());
+        }
+
+        let files = state
+            .files
+            .lock()
+            .map(|files| files.clone())
+            .unwrap_or_default();
+
+        if files.len() != 1 {
+            return Err("Select exactly one PDF to rotate.".to_string());
+        }
+
+        let output_path = state
+            .output_path
+            .lock()
+            .map(|output| output.clone())
+            .unwrap_or(None)
+            .ok_or_else(|| "Choose an output destination first.".to_string())?;
+
+        if state
+            .conversion_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("A conversion is already running.".to_string());
+        }
+
+        (files[0].path.clone(), output_path)
+    };
+
+    let guard_app = app.clone();
+    let task_output = output_path.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ConversionBusyGuard { app: guard_app };
+        rotate::rotate_pdf_with_overwrite(&path, &task_output, &rotations)
+    })
+    .await;
+
+    let outcome = match joined {
+        Ok(result) => result.map_err(|error| error.to_string())?,
+        Err(error) => {
+            app.state::<InputState>()
+                .conversion_in_progress
+                .store(false, Ordering::SeqCst);
+            return Err(error.to_string());
+        }
+    };
+
+    if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
+        *last_output = Some(output_path.clone());
+    }
+    if let Ok(mut last_output_directory) = app.state::<InputState>().last_output_directory.lock() {
+        *last_output_directory = None;
+    }
+
+    let name = output_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output.pdf".to_string());
+    let directory = output_path
+        .parent()
+        .map(|directory| directory.display().to_string())
+        .unwrap_or_default();
+
+    Ok(ConversionResult {
+        pages: outcome.pages,
+        bytes_written: outcome.bytes_written,
+        name,
+        directory,
+        files: None,
+        compression: None,
+    })
+}
+
+fn rotate_input_path(app: &AppHandle) -> Result<(String, PathBuf), String> {
+    let state = app.state::<InputState>();
+    ensure_not_converting(&state)?;
+
+    let action_id = state
+        .action_id
+        .lock()
+        .map(|action_id| action_id.clone())
+        .unwrap_or(None)
+        .ok_or_else(|| "Choose an action first.".to_string())?;
+
+    if action_id != "pdf.rotate_pages" {
+        return Err("This action is not available yet.".to_string());
+    }
+
+    let files = state
+        .files
+        .lock()
+        .map(|files| files.clone())
+        .unwrap_or_default();
+
+    if files.len() != 1 {
+        return Err("Select exactly one PDF.".to_string());
+    }
+
+    Ok((action_id, files[0].path.clone()))
+}
+
 fn last_output_path(state: &InputState) -> Result<PathBuf, String> {
     state
         .last_output
@@ -1616,7 +1804,11 @@ fn compress_input_path(app: &AppHandle) -> Result<PathBuf, String> {
 fn max_files_for_action(action_id: &str) -> usize {
     if matches!(
         action_id,
-        "pdf.split" | "pdf.compress" | "pdf.extract_pages" | "pdf.delete_pages"
+        "pdf.split"
+            | "pdf.compress"
+            | "pdf.extract_pages"
+            | "pdf.delete_pages"
+            | "pdf.rotate_pages"
     ) {
         1
     } else {
@@ -1627,9 +1819,8 @@ fn max_files_for_action(action_id: &str) -> usize {
 fn action_input_kind(action_id: &str) -> Option<&'static str> {
     match action_id {
         "images.convert_to_pdf" => Some("images"),
-        "pdf.merge" | "pdf.split" | "pdf.compress" | "pdf.extract_pages" | "pdf.delete_pages" => {
-            Some("pdf")
-        }
+        "pdf.merge" | "pdf.split" | "pdf.compress" | "pdf.extract_pages" | "pdf.delete_pages"
+        | "pdf.rotate_pages" => Some("pdf"),
         _ => None,
     }
 }
@@ -1723,6 +1914,13 @@ fn category_actions(category_id: &str) -> Vec<ActionInfo> {
                 "pdf.delete_pages",
                 "Delete Pages",
                 "Remove selected pages from a copy",
+                true,
+                Some("pdf"),
+            ),
+            action(
+                "pdf.rotate_pages",
+                "Rotate Pages",
+                "Preview and rotate selected pages",
                 true,
                 Some("pdf"),
             ),
@@ -2178,6 +2376,9 @@ pub fn run() {
             plan_page_selection,
             extract_pages,
             delete_pages,
+            inspect_rotate_source,
+            rotate_pages,
+            render_pdf_thumbnails,
             reveal_output,
             open_output,
             open_output_directory
@@ -2288,7 +2489,7 @@ mod tests {
         assert_eq!(compress_name, "PDF documents");
         assert_eq!(compress_extensions, &["pdf"]);
 
-        for action in ["pdf.extract_pages", "pdf.delete_pages"] {
+        for action in ["pdf.extract_pages", "pdf.delete_pages", "pdf.rotate_pages"] {
             let (name, extensions) = super::filter_for_action(action).expect("PDF page action");
             assert_eq!(name, "PDF documents");
             assert_eq!(extensions, &["pdf"]);
@@ -2403,7 +2604,7 @@ mod tests {
                 .iter()
                 .any(|action| action.id == "pdf.compress" && action.enabled)
         );
-        for id in ["pdf.extract_pages", "pdf.delete_pages"] {
+        for id in ["pdf.extract_pages", "pdf.delete_pages", "pdf.rotate_pages"] {
             assert!(
                 pdf_actions
                     .iter()
@@ -2445,14 +2646,10 @@ mod tests {
         assert_eq!(compress_outcome.selection.limit, 1);
         assert_eq!(compress_outcome.selection.limit_skipped, 1);
 
-        for action in ["pdf.extract_pages", "pdf.delete_pages"] {
+        for action in ["pdf.extract_pages", "pdf.delete_pages", "pdf.rotate_pages"] {
             let state = super::InputState::default();
-            let outcome = super::ingest_paths(
-                &state,
-                action,
-                vec![first.clone(), second.clone()],
-                false,
-            );
+            let outcome =
+                super::ingest_paths(&state, action, vec![first.clone(), second.clone()], false);
             assert_eq!(outcome.accepted, 1);
             assert_eq!(outcome.selection.limit, 1);
             assert_eq!(outcome.selection.limit_skipped, 1);

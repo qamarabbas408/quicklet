@@ -7,6 +7,7 @@ import type {
   PageSelectionMode,
   PageSelectionPlan,
   RadialAction,
+  RotateSourceInfo,
   SplitMode,
   SplitPlan,
 } from "../lib/actions";
@@ -28,6 +29,9 @@ type OutputPanelProps = {
   compressSource: CompressionSourceInfo | null;
   pageSelectionMode: PageSelectionMode | null;
   pagePlan: PageSelectionPlan | null;
+  isRotate: boolean;
+  rotateSource: RotateSourceInfo | null;
+  rotateTurns: Record<number, number>;
   splitMode: SplitMode;
   splitPlan: SplitPlan | null;
   result: ConversionResult | null;
@@ -57,6 +61,9 @@ export function OutputPanel({
   compressSource,
   pageSelectionMode,
   pagePlan,
+  isRotate,
+  rotateSource,
+  rotateTurns,
   splitMode,
   splitPlan,
   result,
@@ -79,11 +86,16 @@ export function OutputPanel({
   const compression = result?.compression;
   const isPageSelection = pageSelectionMode !== null;
   const isExtract = pageSelectionMode === "extract";
+  const rotatePages = Object.keys(rotateTurns)
+    .map(Number)
+    .sort((a, b) => a - b);
   const canConvert = isSplit
     ? outputDirectory !== null && splitPlan !== null && !isChoosing && !isConverting
-    : isPageSelection
-      ? output !== null && pagePlan !== null && !isChoosing && !isConverting
-      : output !== null && !isChoosing && !isConverting;
+    : isRotate
+      ? output !== null && rotatePages.length > 0 && !isChoosing && !isConverting
+      : isPageSelection
+        ? output !== null && pagePlan !== null && !isChoosing && !isConverting
+        : output !== null && !isChoosing && !isConverting;
   const splitExcluded = splitPlan?.excludedPages ?? [];
   const splitIncluded = splitPlan
     ? splitPlan.outputs.reduce((sum, item) => sum + item.pages.length, 0)
@@ -94,33 +106,39 @@ export function OutputPanel({
       ? "Merging PDFs…"
       : isCompress
         ? "Compressing PDF…"
-        : isPageSelection
-          ? isExtract
-            ? "Extracting pages…"
-            : "Deleting pages…"
-          : "Creating PDF…";
+        : isRotate
+          ? "Rotating pages…"
+          : isPageSelection
+            ? isExtract
+              ? "Extracting pages…"
+              : "Deleting pages…"
+            : "Creating PDF…";
   const actionLabelForButton = isSplit
     ? "Split PDF"
     : isMerge
       ? "Merge PDFs"
       : isCompress
         ? "Compress PDF"
-        : isPageSelection
-          ? isExtract
-            ? "Extract Pages"
-            : "Delete Pages"
-          : "Convert to PDF";
+        : isRotate
+          ? "Rotate Pages"
+          : isPageSelection
+            ? isExtract
+              ? "Extract Pages"
+              : "Delete Pages"
+            : "Convert to PDF";
   const retryLabel = isSplit
     ? "Retry split"
     : isMerge
       ? "Retry merge"
       : isCompress
         ? "Retry compression"
-        : isPageSelection
-          ? isExtract
-            ? "Retry extraction"
-            : "Retry deletion"
-          : "Retry conversion";
+        : isRotate
+          ? "Retry rotation"
+          : isPageSelection
+            ? isExtract
+              ? "Retry extraction"
+              : "Retry deletion"
+            : "Retry conversion";
   const presetLabel = (preset: CompressionPreset) =>
     preset === "light"
       ? "Light"
@@ -165,7 +183,9 @@ export function OutputPanel({
               {result
                 ? isCompress
                   ? "Compression complete"
-                  : isPageSelection
+                  : isRotate
+                    ? "Pages rotated"
+                    : isPageSelection
                     ? isExtract
                       ? "Pages extracted"
                       : "Pages deleted"
@@ -322,7 +342,37 @@ export function OutputPanel({
           </>
         ) : (
           <>
-            {isPageSelection ? (
+            {isRotate ? (
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Format</span>
+                  <span className="text-white/85">PDF</span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Pages</span>
+                  <span className="text-white/85">
+                    {rotateSource?.pages ?? "—"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Rotated pages</span>
+                  <span className="text-white/85">{rotatePages.length}</span>
+                </div>
+                <div className="mt-1 flex items-start justify-between gap-3 text-[11px]">
+                  <span className="shrink-0 text-white/45">Rotations</span>
+                  <span className="text-right text-white/85">
+                    {rotatePages.length > 0
+                      ? `Pages ${formatPageRanges(rotatePages)}`
+                      : "None"}
+                  </span>
+                </div>
+                {rotateSource?.hasSignature && (
+                  <p className="mt-2 text-[10px] text-amber-200/85">
+                    Saving will invalidate the existing digital signature.
+                  </p>
+                )}
+              </div>
+            ) : isPageSelection ? (
               <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
                 <div className="flex items-center justify-between text-[11px]">
                   <span className="text-white/45">Format</span>
@@ -542,9 +592,11 @@ export function OutputPanel({
               ? "Split settings"
               : isCompress
                 ? "Compression settings"
-                : isPageSelection
-                  ? "Page selection"
-                  : "Review files"}
+                : isRotate
+                  ? "Page preview"
+                  : isPageSelection
+                    ? "Page selection"
+                    : "Review files"}
           </button>
           <span className="text-white/30">Esc to dismiss</span>
         </div>

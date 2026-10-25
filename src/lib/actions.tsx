@@ -103,6 +103,40 @@ export type PageSelectionPlan = {
   outputCount: number;
 };
 
+export type RotateSourceInfo = {
+  name: string;
+  pages: number;
+  bytes: number;
+  rotations: number[];
+  hasSignature: boolean;
+  maxPages: number;
+  maxInputBytes: number;
+};
+
+export type RotateThumbnailRequest = {
+  page: number;
+  turns: number;
+};
+
+export type RotateThumbnail = {
+  page: number;
+  sourceRotation: number;
+  effectiveRotation: number;
+  width: number;
+  height: number;
+  pngBase64: string;
+};
+
+export type RotatePreviewBatch = {
+  pageCount: number;
+  thumbnails: RotateThumbnail[];
+};
+
+export type RotateChange = {
+  page: number;
+  turns: number;
+};
+
 export type CompressionReport = {
   originalBytes: number;
   outputBytes: number;
