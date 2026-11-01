@@ -2,6 +2,7 @@ import type {
   CompressionPreset,
   CompressionSourceInfo,
   ConversionResult,
+  OperationProgress,
   OutputDirectoryInfo,
   OutputInfo,
   PageSelectionMode,
@@ -34,11 +35,14 @@ type OutputPanelProps = {
   rotateTurns: Record<number, number>;
   splitMode: SplitMode;
   splitPlan: SplitPlan | null;
+  progress: OperationProgress | null;
   result: ConversionResult | null;
   error: string | null;
   resultError: string | null;
+  isCancellingOperation: boolean;
   onChooseOutput: () => void;
   onConvert: () => void;
+  onCancelOperation: () => void;
   onReveal: () => void;
   onOpen: () => void;
   onOpenFolder: () => void;
@@ -66,11 +70,14 @@ export function OutputPanel({
   rotateTurns,
   splitMode,
   splitPlan,
+  progress,
   result,
   error,
   resultError,
+  isCancellingOperation,
   onChooseOutput,
   onConvert,
+  onCancelOperation,
   onReveal,
   onOpen,
   onOpenFolder,
@@ -113,6 +120,41 @@ export function OutputPanel({
               ? "Extracting pages…"
               : "Deleting pages…"
             : "Creating PDF…";
+  const progressMessage =
+    progress?.status === "cancelled"
+      ? "Compression cancelled"
+      : progress?.message ?? busyLabel;
+  const progressCompleted =
+    progress && typeof progress.completed === "number" ? progress.completed : null;
+  const progressTotal =
+    progress && typeof progress.total === "number" ? progress.total : null;
+  const progressPercent =
+    progress && progress.determinate && progressTotal && progressTotal > 0
+      ? Math.min(
+          100,
+          Math.max(0, ((progressCompleted ?? 0) / progressTotal) * 100),
+        )
+      : null;
+  const etaText =
+    typeof progress?.etaSeconds === "number"
+      ? (() => {
+          const totalSeconds = Math.max(0, Math.round(progress.etaSeconds));
+          if (totalSeconds < 45) {
+            return `About ${totalSeconds} seconds remaining`;
+          }
+          if (totalSeconds < 90) {
+            return "About 1 minute remaining";
+          }
+          if (totalSeconds < 3600) {
+            const minutes = Math.max(1, Math.round(totalSeconds / 60));
+            return `About ${minutes} minute${minutes === 1 ? "" : "s"} remaining`;
+          }
+          const hours = Math.max(1, Math.round(totalSeconds / 3600));
+          return `About ${hours} hour${hours === 1 ? "" : "s"} remaining`;
+        })()
+      : progress && progress.determinate
+        ? "Estimating time remaining…"
+        : null;
   const actionLabelForButton = isSplit
     ? "Split PDF"
     : isMerge
@@ -539,10 +581,49 @@ export function OutputPanel({
               </p>
             )}
 
-            {isConverting && (
-              <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-[11px] text-white/60">
-                <span className="conversion-spinner" />
-                {busyLabel}
+            {(isConverting || progress) && (
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                <div className="mb-2 flex items-center justify-between gap-3 text-[11px]">
+                  <span className="flex items-center gap-2 text-white/70">
+                    <span className="conversion-spinner" />
+                    {progressMessage || busyLabel}
+                  </span>
+                  {progressPercent !== null ? (
+                    <span className="text-white/45">
+                      {Math.round(progressPercent)}%
+                    </span>
+                  ) : null}
+                  {isCompress && progress?.status === "running" && !result ? (
+                    <button
+                      type="button"
+                      className="rounded-md border border-white/15 bg-white/5 px-2 py-1 text-[10px] font-medium text-white/75 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      disabled={isCancellingOperation || isChoosing}
+                      onClick={onCancelOperation}
+                    >
+                      {isCancellingOperation ? "Cancelling…" : "Cancel"}
+                    </button>
+                  ) : null}
+                </div>
+                {progressPercent !== null ? (
+                  <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                    <div
+                      className="h-full rounded-full bg-emerald-400 transition-[width] duration-200"
+                      style={{ width: `${progressPercent}%` }}
+                    />
+                  </div>
+                ) : (
+                  <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                    <div className="h-full w-1/3 animate-pulse rounded-full bg-white/50" />
+                  </div>
+                )}
+                {progress && progress.determinate && progressCompleted !== null && progressTotal !== null && (
+                  <p className="mt-2 text-[10px] text-white/45">
+                    {progressCompleted} / {progressTotal} {progress.unit ?? "items"}
+                  </p>
+                )}
+                {etaText && (
+                  <p className="mt-2 text-[10px] text-emerald-200/80">{etaText}</p>
+                )}
               </div>
             )}
 

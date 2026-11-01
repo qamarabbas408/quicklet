@@ -10,8 +10,8 @@ pub mod split;
 use chrono::Local;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
@@ -102,6 +102,318 @@ struct ConversionResult {
     compression: Option<ConversionCompression>,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationProgressOutput {
+    name: Option<String>,
+    directory: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationProgressSnapshot {
+    operation_id: String,
+    status: String,
+    stage: String,
+    message: String,
+    determinate: bool,
+    completed: Option<u64>,
+    total: Option<u64>,
+    unit: Option<String>,
+    eta_seconds: Option<u64>,
+    error: Option<String>,
+    output: Option<OperationProgressOutput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OperationProgressFields {
+    operation_id: String,
+    status: String,
+    stage: String,
+    message: String,
+    determinate: bool,
+    completed: u64,
+    total: u64,
+    unit: Option<String>,
+    eta_seconds: Option<u64>,
+    error: Option<String>,
+    output: Option<OperationProgressOutput>,
+}
+
+impl OperationProgressSnapshot {
+    fn from_fields(fields: OperationProgressFields) -> Self {
+        let completed = if fields.determinate {
+            Some(fields.completed)
+        } else {
+            None
+        };
+        let total = if fields.determinate { Some(fields.total) } else { None };
+        Self {
+            operation_id: fields.operation_id,
+            status: fields.status,
+            stage: fields.stage,
+            message: fields.message,
+            determinate: fields.determinate,
+            completed,
+            total,
+            unit: fields.unit,
+            eta_seconds: fields.eta_seconds,
+            error: fields.error,
+            output: fields.output,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        operation_id: impl Into<String>,
+        status: impl Into<String>,
+        stage: impl Into<String>,
+        message: impl Into<String>,
+        determinate: bool,
+        completed: u64,
+        total: u64,
+        unit: Option<&str>,
+        eta_seconds: Option<u64>,
+        error: Option<String>,
+        output: Option<OperationProgressOutput>,
+    ) -> Self {
+        Self::from_fields(OperationProgressFields {
+            operation_id: operation_id.into(),
+            status: status.into(),
+            stage: stage.into(),
+            message: message.into(),
+            determinate,
+            completed,
+            total,
+            unit: unit.map(str::to_owned),
+            eta_seconds,
+            error,
+            output,
+        })
+    }
+
+    pub fn is_valid_determinate_progress(&self) -> bool {
+        self.determinate
+            && self.completed.is_some()
+            && self.total.is_some()
+            && self.total.filter(|total| *total > 0).is_some()
+            && self
+                .completed
+                .zip(self.total)
+                .is_some_and(|(completed, total)| completed <= total)
+    }
+}
+
+struct CompressionProgressSnapshotInput<'a> {
+    operation_id: &'a str,
+    status: &'a str,
+    stage: &'a str,
+    message: String,
+    completed: u64,
+    total: u64,
+    unit: Option<&'a str>,
+    eta_seconds: Option<u64>,
+    error: Option<String>,
+    output: Option<OperationProgressOutput>,
+}
+
+fn compression_progress_snapshot(input: CompressionProgressSnapshotInput<'_>) -> OperationProgressSnapshot {
+    let is_finalization_stage = matches!(input.stage, "saving" | "validating" | "finalizing");
+    OperationProgressSnapshot::new(
+        input.operation_id,
+        input.status,
+        input.stage,
+        input.message,
+        !is_finalization_stage,
+        if is_finalization_stage { 0 } else { input.completed },
+        if is_finalization_stage { 0 } else { input.total },
+        if is_finalization_stage { None } else { input.unit },
+        if is_finalization_stage { None } else { input.eta_seconds },
+        input.error,
+        input.output,
+    )
+}
+
+#[derive(Default)]
+struct CompressionEtaEstimator {
+    stage: Option<String>,
+    smoothed_rate: Option<f64>,
+    observations: usize,
+}
+
+impl CompressionEtaEstimator {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn record(&mut self, stage: &str, completed: u64, total: u64, elapsed_seconds: f64) -> Option<u64> {
+        if self.stage.as_deref() != Some(stage) {
+            self.stage = Some(stage.to_string());
+            self.smoothed_rate = None;
+            self.observations = 0;
+        }
+
+        if total == 0 || completed == 0 || completed >= total || elapsed_seconds <= 0.0 {
+            return None;
+        }
+
+        let throughput = completed as f64 / elapsed_seconds;
+        let smoothed = match self.smoothed_rate {
+            Some(current) => (current * 0.7) + (throughput * 0.3),
+            None => throughput,
+        };
+        self.smoothed_rate = Some(smoothed);
+        self.observations += 1;
+
+        if self.observations < 2 || !smoothed.is_finite() || smoothed <= 0.0 {
+            return None;
+        }
+
+        let remaining = total.saturating_sub(completed) as f64;
+        let eta = remaining / smoothed;
+        if eta.is_finite() && eta > 0.0 {
+            Some(eta.round() as u64)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Default)]
+struct OperationCancellationState {
+    tokens: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+impl OperationCancellationState {
+    #[allow(dead_code)]
+    fn begin(&self, operation_id: &str) -> Arc<AtomicBool> {
+        let token = Arc::new(AtomicBool::new(false));
+        self.tokens
+            .lock()
+            .map(|mut tokens| {
+                tokens.insert(operation_id.to_string(), token.clone());
+            })
+            .ok();
+        token
+    }
+
+    fn request_cancel(&self, operation_id: &str) -> bool {
+        let Some(token) = self.tokens.lock().ok().and_then(|tokens| tokens.get(operation_id).cloned()) else {
+            return false;
+        };
+        token.store(true, Ordering::SeqCst);
+        true
+    }
+
+    #[allow(dead_code)]
+    fn is_cancelled(&self, operation_id: &str) -> bool {
+        self.tokens
+            .lock()
+            .ok()
+            .and_then(|tokens| tokens.get(operation_id).cloned())
+            .is_some_and(|token| token.load(Ordering::SeqCst))
+    }
+
+    fn clear(&self, operation_id: &str) {
+        let _ = self.tokens.lock().map(|mut tokens| {
+            tokens.remove(operation_id);
+        });
+    }
+}
+
+#[derive(Default)]
+struct OperationProgressState {
+    next_id: AtomicU64,
+    current: Mutex<Option<OperationProgressSnapshot>>,
+}
+
+#[allow(dead_code)]
+impl OperationProgressState {
+    fn next_operation_id(&self, operation_type: &str) -> String {
+        let next = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+        format!("{operation_type}:{next}")
+    }
+
+    fn begin(&self, operation_type: &str, message: &str) -> OperationProgressSnapshot {
+        let operation_id = self.next_operation_id(operation_type);
+        let snapshot = OperationProgressSnapshot::new(
+            operation_id.clone(),
+            "running",
+            "preparing",
+            message,
+            false,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        );
+        if let Ok(mut current) = self.current.lock() {
+            *current = Some(snapshot.clone());
+        }
+        snapshot
+    }
+
+    fn update(&self, snapshot: OperationProgressSnapshot) {
+        if self.accepts_snapshot(&snapshot)
+            && let Ok(mut current) = self.current.lock()
+        {
+            *current = Some(snapshot.clone());
+        }
+    }
+
+    fn accepts_snapshot(&self, snapshot: &OperationProgressSnapshot) -> bool {
+        let Some(current) = self.current.lock().ok().and_then(|current| current.clone()) else {
+            return true;
+        };
+
+        if current.operation_id != snapshot.operation_id {
+            return false;
+        }
+
+        if let (Some(current_completed), Some(new_completed)) =
+            (current.completed, snapshot.completed)
+            && new_completed < current_completed
+        {
+            return false;
+        }
+
+        if let (Some(current_total), Some(new_total)) = (current.total, snapshot.total)
+            && new_total < current_total
+        {
+            return false;
+        }
+
+        true
+    }
+
+    fn current_operation_id(&self) -> Option<String> {
+        self.current
+            .lock()
+            .ok()
+            .and_then(|current| current.clone())
+            .map(|snapshot| snapshot.operation_id)
+    }
+
+    fn snapshot(&self) -> Option<OperationProgressSnapshot> {
+        self.current.lock().ok().and_then(|current| current.clone())
+    }
+}
+
+fn emit_operation_progress(app: &AppHandle, snapshot: &OperationProgressSnapshot) {
+    let state = app.state::<OperationProgressState>();
+    if !state.accepts_snapshot(snapshot) {
+        return;
+    }
+
+    if let Ok(mut current) = state.current.lock() {
+        *current = Some(snapshot.clone());
+    }
+    let _ = app.emit("operation-progress", snapshot.clone());
+}
+
 struct ConversionBusyGuard {
     app: AppHandle,
 }
@@ -121,6 +433,38 @@ fn ensure_not_converting(state: &InputState) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+#[tauri::command]
+fn get_operation_progress(app: AppHandle) -> Option<OperationProgressSnapshot> {
+    app.state::<OperationProgressState>().snapshot()
+}
+
+#[tauri::command]
+fn cancel_operation(app: AppHandle, operation_id: Option<String>) -> Result<(), String> {
+    let target = operation_id.or_else(|| app.state::<OperationProgressState>().current_operation_id())
+        .ok_or_else(|| "No active operation to cancel.".to_string())?;
+
+    let active = app.state::<OperationCancellationState>().request_cancel(&target);
+    if !active {
+        return Err("No active operation to cancel.".to_string());
+    }
+
+    let snapshot = OperationProgressSnapshot::new(
+        target,
+        "running",
+        "cancelling",
+        "Cancelling…",
+        false,
+        0,
+        0,
+        None,
+        None,
+        None,
+        None,
+    );
+    emit_operation_progress(&app, &snapshot);
+    Ok(())
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -590,17 +934,57 @@ async fn convert_to_pdf(app: AppHandle) -> Result<ConversionResult, String> {
         )
     };
 
-    let guard_app = app.clone();
+    let progress_state = app.state::<OperationProgressState>();
+    let operation = progress_state.begin("images.convert_to_pdf", "Preparing PDF conversion");
+    emit_operation_progress(&app, &operation);
+
+    let progress_app = app.clone();
+    let progress_op_id = operation.operation_id.clone();
     let task_output = output.clone();
+    let task_progress_id = progress_op_id.clone();
     let joined = tauri::async_runtime::spawn_blocking(move || {
-        let _guard = ConversionBusyGuard { app: guard_app };
-        pdf::convert_images_to_pdf_with_overwrite(&paths, &task_output)
-    })
-    .await;
+        let _guard = ConversionBusyGuard { app: progress_app.clone() };
+        pdf::convert_images_to_pdf_with_progress(&paths, &task_output, true, |completed, total, stage| {
+            let message = match stage {
+                "reading" => format!("Reading images {completed}/{total}"),
+                "building" => format!("Building PDF {completed}/{total} pages"),
+                "writing" => "Writing PDF to output".to_string(),
+                _ => "Preparing PDF conversion".to_string(),
+            };
+            let snapshot = OperationProgressSnapshot::new(
+                task_progress_id.clone(),
+                "running",
+                stage,
+                message,
+                true,
+                completed as u64,
+                total as u64,
+                Some("images"),
+                None,
+                None,
+                None,
+            );
+            emit_operation_progress(&progress_app, &snapshot);
+        })
+    }).await;
 
     let outcome = match joined {
         Ok(result) => result.map_err(|error| error.to_string())?,
         Err(error) => {
+            let snapshot = OperationProgressSnapshot::new(
+                progress_op_id.clone(),
+                "failed",
+                "error",
+                format!("PDF conversion failed: {error}"),
+                false,
+                0,
+                0,
+                None,
+                None,
+                Some(format!("PDF conversion failed: {error}")),
+                None,
+            );
+            emit_operation_progress(&app, &snapshot);
             app.state::<InputState>()
                 .conversion_in_progress
                 .store(false, Ordering::SeqCst);
@@ -623,6 +1007,25 @@ async fn convert_to_pdf(app: AppHandle) -> Result<ConversionResult, String> {
         .parent()
         .map(|directory| directory.display().to_string())
         .unwrap_or_default();
+
+    let snapshot = OperationProgressSnapshot::new(
+        progress_op_id,
+        "succeeded",
+        "complete",
+        format!("PDF created successfully ({})", name),
+        true,
+        outcome.pages as u64,
+        outcome.pages as u64,
+        Some("pages"),
+        None,
+        None,
+        Some(OperationProgressOutput {
+            name: Some(name.clone()),
+            directory: Some(directory.clone()),
+            path: Some(output.display().to_string()),
+        }),
+    );
+    emit_operation_progress(&app, &snapshot);
 
     Ok(ConversionResult {
         pages: outcome.pages,
@@ -1031,23 +1434,99 @@ async fn compress_pdf(app: AppHandle, preset: String) -> Result<ConversionResult
         (files[0].path.clone(), output_path, preset)
     };
 
+    let progress_state = app.state::<OperationProgressState>();
+    let operation = progress_state.begin("pdf.compress", "Preparing PDF compression");
+    let cancellation_state = app.state::<OperationCancellationState>();
+    let cancel_token = cancellation_state.begin(&operation.operation_id);
+    emit_operation_progress(&app, &operation);
+
+    let progress_app = app.clone();
+    let progress_op_id = operation.operation_id.clone();
+    let progress_op_id_for_task = progress_op_id.clone();
     let guard_app = app.clone();
     let task_output = output_path.clone();
+    let eta_estimator = Arc::new(Mutex::new(CompressionEtaEstimator::new()));
+    let started_at = Instant::now();
+    let eta_estimator_clone = Arc::clone(&eta_estimator);
     let joined = tauri::async_runtime::spawn_blocking(move || {
         let _guard = ConversionBusyGuard { app: guard_app };
-        compress::compress_pdf_with_overwrite(&path, &task_output, preset)
+        let cancel_flag = cancel_token;
+        compress::compress_pdf_with_overwrite_and_progress_cancelable(
+            &path,
+            &task_output,
+            preset,
+            &cancel_flag,
+            |stage, completed, total| {
+                let elapsed = started_at.elapsed().as_secs_f64();
+                let eta_seconds = {
+                    let mut estimator = eta_estimator_clone.lock().unwrap();
+                    estimator.record(stage, completed, total, elapsed)
+                };
+                let message = match stage {
+                    "streams" => format!("Compressing streams {completed}/{total}"),
+                    "images" => format!("Inspecting images {completed}/{total}"),
+                    "saving" => "Saving and validating PDF…".to_string(),
+                    _ => "Compressing PDF…".to_string(),
+                };
+                let snapshot = compression_progress_snapshot(CompressionProgressSnapshotInput {
+                    operation_id: &progress_op_id_for_task,
+                    status: "running",
+                    stage,
+                    message: message.to_string(),
+                    completed,
+                    total,
+                    unit: match stage {
+                        "streams" => Some("objects"),
+                        "images" => Some("images"),
+                        _ => None,
+                    },
+                    eta_seconds,
+                    error: None,
+                    output: None,
+                });
+                emit_operation_progress(&progress_app, &snapshot);
+            },
+        )
     })
     .await;
 
     let outcome = match joined {
-        Ok(result) => result.map_err(|error| error.to_string())?,
+        Ok(result) => match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                cancellation_state.clear(&progress_op_id);
+                if matches!(error, compress::CompressError::Cancelled { .. }) {
+                    let snapshot = OperationProgressSnapshot::new(
+                        progress_op_id.clone(),
+                        "cancelled",
+                        "cancelled",
+                        "Compression cancelled",
+                        false,
+                        0,
+                        0,
+                        None,
+                        None,
+                        Some(error.to_string()),
+                        None,
+                    );
+                    emit_operation_progress(&app, &snapshot);
+                    return Err("Compression cancelled".to_string());
+                }
+                app.state::<InputState>()
+                    .conversion_in_progress
+                    .store(false, Ordering::SeqCst);
+                return Err(error.to_string());
+            }
+        },
         Err(error) => {
+            cancellation_state.clear(&progress_op_id);
             app.state::<InputState>()
                 .conversion_in_progress
                 .store(false, Ordering::SeqCst);
             return Err(error.to_string());
         }
     };
+    cancellation_state.clear(&progress_op_id);
 
     if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
         *last_output = Some(output_path.clone());
@@ -1068,6 +1547,24 @@ async fn compress_pdf(app: AppHandle, preset: String) -> Result<ConversionResult
         compress::CompressionStatus::Reduced => "reduced",
         compress::CompressionStatus::NoReduction => "no-reduction",
     };
+    let snapshot = OperationProgressSnapshot::new(
+        progress_op_id,
+        "succeeded",
+        "complete",
+        format!("PDF compressed successfully ({})", name),
+        true,
+        1,
+        1,
+        Some("items"),
+        None,
+        None,
+        Some(OperationProgressOutput {
+            name: Some(name.clone()),
+            directory: Some(directory.clone()),
+            path: Some(output_path.display().to_string()),
+        }),
+    );
+    emit_operation_progress(&app, &snapshot);
 
     Ok(ConversionResult {
         pages: outcome.pages,
@@ -2128,9 +2625,7 @@ fn note_menu_shown(app: &AppHandle) {
 }
 
 fn should_hide_on_blur(last_shown_at: Option<Instant>, input_busy: bool) -> bool {
-    !input_busy
-        && !last_shown_at
-            .is_some_and(|shown_at| shown_at.elapsed() < BLUR_GRACE_PERIOD)
+    !input_busy && last_shown_at.is_none_or(|shown_at| shown_at.elapsed() >= BLUR_GRACE_PERIOD)
 }
 
 fn compute_menu_position(
@@ -2331,6 +2826,8 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .manage(MenuState::default())
         .manage(InputState::default())
+        .manage(OperationProgressState::default())
+        .manage(OperationCancellationState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(
@@ -2353,6 +2850,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_menu,
             keep_menu_alive,
+            get_operation_progress,
+            cancel_operation,
             dismiss_menu,
             get_menu_status,
             pick_input_files,
@@ -2707,4 +3206,157 @@ mod tests {
 
         std::fs::remove_dir_all(dir).expect("test directory should be removed");
     }
+
+    #[test]
+    fn operation_progress_rejects_invalid_determinate_ranges() {
+        let invalid = super::OperationProgressSnapshot::new(
+            "images.convert_to_pdf",
+            "running",
+            "Preparing",
+            "Preparing PDF conversion",
+            true,
+            3,
+            2,
+            Some("pages"),
+            None,
+            None,
+            None,
+        );
+        assert!(!invalid.is_valid_determinate_progress());
+
+        let valid = super::OperationProgressSnapshot::new(
+            "images.convert_to_pdf",
+            "running",
+            "Writing",
+            "Writing PDF pages",
+            true,
+            3,
+            5,
+            Some("pages"),
+            None,
+            None,
+            None,
+        );
+        assert!(valid.is_valid_determinate_progress());
+    }
+
+    #[test]
+    fn operation_progress_state_tracks_unique_operation_ids() {
+        let state = super::OperationProgressState::default();
+        let first = state.begin("images.convert_to_pdf", "Preparing conversion");
+        let second = state.begin("images.convert_to_pdf", "Writing PDF");
+
+        assert_ne!(first.operation_id, second.operation_id);
+        assert_eq!(state.current_operation_id().as_deref(), Some(second.operation_id.as_str()));
+        assert_eq!(state.snapshot().as_ref().map(|snapshot| snapshot.operation_id.as_str()), Some(second.operation_id.as_str()));
+    }
+
+    #[test]
+    fn operation_progress_ignores_stale_events_and_non_monotonic_updates() {
+        let state = super::OperationProgressState::default();
+        let first = state.begin("images.convert_to_pdf", "Preparing conversion");
+        let second = state.begin("images.convert_to_pdf", "Writing PDF");
+
+        let stale = super::OperationProgressSnapshot::new(
+            first.operation_id.clone(),
+            "running",
+            "reading",
+            "Reading images 1/4",
+            true,
+            1,
+            4,
+            Some("images"),
+            None,
+            None,
+            None,
+        );
+        assert!(!state.accepts_snapshot(&stale));
+
+        let late = super::OperationProgressSnapshot::new(
+            second.operation_id.clone(),
+            "running",
+            "reading",
+            "Reading images 2/4",
+            true,
+            2,
+            4,
+            Some("images"),
+            None,
+            None,
+            None,
+        );
+        assert!(state.accepts_snapshot(&late));
+        state.update(late.clone());
+
+        let regressed = super::OperationProgressSnapshot::new(
+            second.operation_id.clone(),
+            "running",
+            "reading",
+            "Reading images 1/4",
+            true,
+            1,
+            4,
+            Some("images"),
+            None,
+            None,
+            None,
+        );
+        assert!(!state.accepts_snapshot(&regressed));
+    }
+
+    #[test]
+    fn compression_eta_starts_unavailable_and_becomes_available_with_observations() {
+        let mut estimator = super::CompressionEtaEstimator::new();
+
+        assert_eq!(estimator.record("streams", 1, 10, 0.25), None);
+        assert_eq!(estimator.record("streams", 5, 10, 1.5), Some(1));
+        assert_eq!(estimator.record("streams", 7, 10, 2.5), Some(1));
+    }
+
+    #[test]
+    fn compression_eta_resets_when_stage_changes() {
+        let mut estimator = super::CompressionEtaEstimator::new();
+
+        assert_eq!(estimator.record("streams", 6, 10, 3.0), None);
+        assert_eq!(estimator.record("saving", 1, 1, 0.25), None);
+        assert_eq!(estimator.record("streams", 8, 10, 3.5), None);
+        assert_eq!(estimator.record("streams", 9, 10, 4.0), Some(0));
+    }
+
+    #[test]
+    fn compression_finalization_stages_are_indeterminate() {
+        let snapshot = super::compression_progress_snapshot(super::CompressionProgressSnapshotInput {
+            operation_id: "pdf.compress:1",
+            status: "running",
+            stage: "saving",
+            message: "Saving compressed PDF…".to_string(),
+            completed: 1,
+            total: 1,
+            unit: Some("items"),
+            eta_seconds: Some(12),
+            error: None,
+            output: None,
+        });
+
+        assert!(!snapshot.determinate);
+        assert_eq!(snapshot.completed, None);
+        assert_eq!(snapshot.total, None);
+        assert_eq!(snapshot.eta_seconds, None);
+        assert_eq!(snapshot.stage, "saving");
+    }
+
+    #[test]
+    fn operation_cancellation_tracks_active_operation_tokens() {
+        let state = super::OperationCancellationState::default();
+        let token = state.begin("pdf.compress:9");
+
+        assert!(!token.load(Ordering::SeqCst));
+        assert!(state.request_cancel("pdf.compress:9"));
+        assert!(state.is_cancelled("pdf.compress:9"));
+        assert!(token.load(Ordering::SeqCst));
+
+        state.clear("pdf.compress:9");
+        assert!(!state.is_cancelled("pdf.compress:9"));
+    }
+
 }
