@@ -122,3 +122,29 @@ export type ConversionResult = {
   files?: ConversionFile[];
   compression?: CompressionReport;
 };
+
+export type OperationProgressStatus =
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export type OperationProgressOutput = {
+  name?: string;
+  directory?: string;
+  path?: string;
+};
+
+export type OperationProgress = {
+  operationId: string;
+  status: OperationProgressStatus;
+  stage: string;
+  message: string;
+  determinate: boolean;
+  completed?: number;
+  total?: number;
+  unit?: "pages" | "files" | "images" | "bytes" | string;
+  etaSeconds?: number;
+  error?: string;
+  output?: OperationProgressOutput;
+};

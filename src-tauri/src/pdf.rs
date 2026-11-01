@@ -134,7 +134,7 @@ struct PageImage {
 ///
 /// Input paths are read in order. Existing output files are never overwritten.
 pub fn convert_images_to_pdf(inputs: &[PathBuf], output: &Path) -> Result<PdfOutcome, PdfError> {
-    convert(inputs, output, false)
+    convert_with_progress(inputs, output, false, |_, _, _| {})
 }
 
 /// Like [`convert_images_to_pdf`], but replaces an existing output file.
@@ -145,14 +145,32 @@ pub fn convert_images_to_pdf_with_overwrite(
     inputs: &[PathBuf],
     output: &Path,
 ) -> Result<PdfOutcome, PdfError> {
-    convert(inputs, output, true)
+    convert_with_progress(inputs, output, true, |_, _, _| {})
 }
 
-fn convert(
+pub fn convert_images_to_pdf_with_progress<F>(
     inputs: &[PathBuf],
     output: &Path,
     allow_overwrite: bool,
-) -> Result<PdfOutcome, PdfError> {
+    mut on_progress: F,
+) -> Result<PdfOutcome, PdfError>
+where
+    F: FnMut(usize, usize, &str),
+{
+    convert_with_progress(inputs, output, allow_overwrite, |completed, total, stage| {
+        on_progress(completed, total, stage);
+    })
+}
+
+fn convert_with_progress<F>(
+    inputs: &[PathBuf],
+    output: &Path,
+    allow_overwrite: bool,
+    mut on_progress: F,
+) -> Result<PdfOutcome, PdfError>
+where
+    F: FnMut(usize, usize, &str),
+{
     if inputs.is_empty() {
         return Err(PdfError::NoInputs);
     }
@@ -162,11 +180,20 @@ fn convert(
 
     validate_output(output, allow_overwrite)?;
 
-    let pages = inputs
-        .iter()
-        .map(|path| read_page(path))
-        .collect::<Result<Vec<_>, _>>()?;
+    let total = inputs.len();
+    on_progress(0, total, "reading");
+
+    let mut pages = Vec::with_capacity(total);
+    for (index, path) in inputs.iter().enumerate() {
+        let page = read_page(path)?;
+        pages.push(page);
+        on_progress(index + 1, total, "reading");
+    }
+
+    on_progress(total, total, "building");
     let bytes = build_pdf(&pages);
+
+    on_progress(total, total, "writing");
     write_safely(output, &bytes, allow_overwrite)?;
 
     Ok(PdfOutcome {

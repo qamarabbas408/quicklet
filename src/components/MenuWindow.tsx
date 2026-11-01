@@ -15,6 +15,7 @@ import type {
   CompressionPreset,
   CompressionSourceInfo,
   ConversionResult,
+  OperationProgress,
   OutputDirectoryInfo,
   OutputInfo,
   PageSelectionMode,
@@ -95,6 +96,9 @@ export function MenuWindow() {
   const [dragCount, setDragCount] = useState(0);
   const [settingsState, setSettingsState] = useState<SettingsState | null>(null);
   const [settingsLoading, setSettingsLoading] = useState(false);
+  const [operationProgress, setOperationProgress] =
+    useState<OperationProgress | null>(null);
+  const [isCancellingOperation, setIsCancellingOperation] = useState(false);
 
   const loadSettings = useCallback(async () => {
     setSettingsLoading(true);
@@ -151,6 +155,8 @@ export function MenuWindow() {
     setIsDragActive(false);
     setDragCount(0);
     setSettingsState(null);
+    setOperationProgress(null);
+    setIsCancellingOperation(false);
   }, []);
 
   const dismiss = useCallback(() => {
@@ -235,6 +241,12 @@ export function MenuWindow() {
       }),
     );
 
+    track(
+      listen<OperationProgress>("operation-progress", (event) => {
+        setOperationProgress(event.payload);
+      }),
+    );
+
     return () => {
       disposed = true;
       for (const unlisten of unlisteners) {
@@ -242,6 +254,14 @@ export function MenuWindow() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!IS_TAURI || !isOpen) return;
+
+    void invoke<OperationProgress | null>("get_operation_progress")
+      .then((progress) => setOperationProgress(progress ?? null))
+      .catch(() => setOperationProgress(null));
+  }, [isOpen]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -676,11 +696,36 @@ export function MenuWindow() {
       }
       setConversionResult(result);
     } catch (error) {
-      setConversionError(String(error));
+      const message = String(error);
+      if (message.toLowerCase().includes("cancelled")) {
+        setConversionError(null);
+      } else {
+        setConversionError(message);
+      }
     } finally {
       setIsConverting(false);
+      setIsCancellingOperation(false);
     }
   };
+
+  const cancelCurrentOperation = async () => {
+    if (isCancellingOperation || !operationProgress || operationProgress.status !== "running") {
+      return;
+    }
+
+    setIsCancellingOperation(true);
+    try {
+      await invoke("cancel_operation", { operationId: operationProgress.operationId });
+    } catch (error) {
+      setIsCancellingOperation(false);
+      setConversionError(String(error));
+    }
+  };
+
+  useEffect(() => {
+    if (!operationProgress || operationProgress.status === "running") return;
+    setIsCancellingOperation(false);
+  }, [operationProgress]);
 
   const runResultAction = async (
     command: "reveal_output" | "open_output" | "open_output_directory",
@@ -995,11 +1040,14 @@ export function MenuWindow() {
           pagePlan={pagePlan}
           splitMode={splitMode}
           splitPlan={splitPlan}
+          progress={operationProgress}
           result={conversionResult}
           error={conversionError ?? outputError}
           resultError={resultActionError}
+          isCancellingOperation={isCancellingOperation}
           onChooseOutput={() => void chooseOutput()}
           onConvert={() => void convert()}
+          onCancelOperation={() => void cancelCurrentOperation()}
           onReveal={() => void runResultAction("reveal_output")}
           onOpen={() => void runResultAction("open_output")}
           onOpenFolder={() => void runResultAction("open_output_directory")}
