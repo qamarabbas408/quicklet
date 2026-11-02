@@ -6,6 +6,7 @@ import { CompressionSettings } from "./CompressionSettings";
 import { FileConfirmation } from "./FileConfirmation";
 import { OutputPanel } from "./OutputPanel";
 import { PageSelectionSettings } from "./PageSelectionSettings";
+import { RotatePreview } from "./RotatePreview";
 import { SplitSettings } from "./SplitSettings";
 import { QuickletMark } from "./icons";
 import { RadialMenu } from "./RadialMenu";
@@ -14,12 +15,14 @@ import type {
   CompressionPreset,
   CompressionSourceInfo,
   ConversionResult,
+  OperationProgress,
   OutputDirectoryInfo,
   OutputInfo,
   PageSelectionMode,
   PageSelectionPlan,
   PageSourceInfo,
   RadialAction,
+  RotateSourceInfo,
   SplitMode,
   SplitPlan,
   SplitSourceInfo,
@@ -35,6 +38,7 @@ type Stage =
   | "configure"
   | "compression"
   | "pages"
+  | "preview"
   | "output";
 
 type DragState = {
@@ -87,10 +91,19 @@ export function MenuWindow() {
   const [pagePlan, setPagePlan] = useState<PageSelectionPlan | null>(null);
   const [pagePlanError, setPagePlanError] = useState<string | null>(null);
   const [isPlanningPages, setIsPlanningPages] = useState(false);
+  const [isInspectingRotate, setIsInspectingRotate] = useState(false);
+  const [rotateSource, setRotateSource] = useState<RotateSourceInfo | null>(null);
+  const [rotateSelectedPages, setRotateSelectedPages] = useState<Set<number>>(
+    new Set(),
+  );
+  const [rotateTurns, setRotateTurns] = useState<Record<number, number>>({});
   const [pickerError, setPickerError] = useState<string | null>(null);
   const [isDropMode, setIsDropMode] = useState(false);
   const [isDragActive, setIsDragActive] = useState(false);
   const [dragCount, setDragCount] = useState(0);
+  const [operationProgress, setOperationProgress] =
+    useState<OperationProgress | null>(null);
+  const [isCancellingOperation, setIsCancellingOperation] = useState(false);
 
   const resetSession = useCallback(() => {
     setStage("radial");
@@ -126,9 +139,15 @@ export function MenuWindow() {
     setPagePlan(null);
     setPagePlanError(null);
     setIsPlanningPages(false);
+    setIsInspectingRotate(false);
+    setRotateSource(null);
+    setRotateSelectedPages(new Set());
+    setRotateTurns({});
     setIsDropMode(false);
     setIsDragActive(false);
     setDragCount(0);
+    setOperationProgress(null);
+    setIsCancellingOperation(false);
   }, []);
 
   const dismiss = useCallback(() => {
@@ -196,6 +215,9 @@ export function MenuWindow() {
         setCompressSource(null);
         setPageSource(null);
         setPagePlan(null);
+        setRotateSource(null);
+        setRotateSelectedPages(new Set());
+        setRotateTurns({});
         setConversionResult(null);
         setStage("input");
         setIsDropMode(false);
@@ -213,6 +235,12 @@ export function MenuWindow() {
       }),
     );
 
+    track(
+      listen<OperationProgress>("operation-progress", (event) => {
+        setOperationProgress(event.payload);
+      }),
+    );
+
     return () => {
       disposed = true;
       for (const unlisten of unlisteners) {
@@ -220,6 +248,14 @@ export function MenuWindow() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!IS_TAURI || !isOpen) return;
+
+    void invoke<OperationProgress | null>("get_operation_progress")
+      .then((progress) => setOperationProgress(progress ?? null))
+      .catch(() => setOperationProgress(null));
+  }, [isOpen]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -386,6 +422,72 @@ export function MenuWindow() {
     };
   }, [stage, pageSource, pageSelection]);
 
+  const beginRotateSetup = useCallback(async () => {
+    if (isInspectingRotate) return;
+
+    setIsInspectingRotate(true);
+    setPickerError(null);
+    setRotateSource(null);
+    setRotateSelectedPages(new Set());
+    setRotateTurns({});
+
+    try {
+      const before = await invoke<InputSelection>("get_input");
+      const source = await invoke<RotateSourceInfo>("inspect_rotate_source");
+      const after = await invoke<InputSelection>("get_input");
+
+      if (
+        after.files.length !== 1 ||
+        before.files[0]?.id !== after.files[0]?.id
+      ) {
+        setInputSelection(after);
+        setStage("input");
+        return;
+      }
+
+      setRotateSource(source);
+      setRotateSelectedPages(new Set());
+      setRotateTurns({});
+      setOutputInfo(null);
+      setOutputError(null);
+      setConversionResult(null);
+      setConversionError(null);
+      setResultActionError(null);
+      setStage("preview");
+    } catch (error) {
+      setPickerError(String(error));
+    } finally {
+      setIsInspectingRotate(false);
+    }
+  }, [isInspectingRotate]);
+
+  const toggleRotatePage = (page: number) => {
+    setRotateSelectedPages((current) => {
+      const next = new Set(current);
+      if (next.has(page)) next.delete(page);
+      else next.add(page);
+      return next;
+    });
+  };
+
+  const rotateSelectedPagesNow = () => {
+    if (rotateSelectedPages.size === 0) return;
+    setRotateTurns((current) => {
+      const next = { ...current };
+      for (const page of rotateSelectedPages) {
+        const turns = ((current[page] ?? 0) + 1) % 4;
+        if (turns === 0) delete next[page];
+        else next[page] = turns;
+      }
+      return next;
+    });
+    setOutputInfo(null);
+    setOutputError(null);
+    setConversionResult(null);
+    setConversionError(null);
+    setResultActionError(null);
+  };
+
   useEffect(() => {
     if (stage !== "configure" || splitSource === null) return;
 
@@ -458,6 +560,9 @@ export function MenuWindow() {
     setPageSelection("");
     setPagePlan(null);
     setPagePlanError(null);
+    setRotateSource(null);
+    setRotateSelectedPages(new Set());
+    setRotateTurns({});
 
     try {
       const started = await invoke<ActionInfo>("start_action", {
@@ -499,6 +604,9 @@ export function MenuWindow() {
         setPageSelection("");
         setPagePlan(null);
         setPagePlanError(null);
+        setRotateSource(null);
+        setRotateSelectedPages(new Set());
+        setRotateTurns({});
         setConversionResult(null);
         setConversionError(null);
         setResultActionError(null);
@@ -527,6 +635,9 @@ export function MenuWindow() {
       setPageSelection("");
       setPagePlan(null);
       setPagePlanError(null);
+      setRotateSource(null);
+      setRotateSelectedPages(new Set());
+      setRotateTurns({});
       setConversionResult(null);
       setConversionError(null);
       setResultActionError(null);
@@ -565,6 +676,9 @@ export function MenuWindow() {
       setPageSelection("");
       setPagePlan(null);
       setPagePlanError(null);
+      setRotateSource(null);
+      setRotateSelectedPages(new Set());
+      setRotateTurns({});
       setOutputError(null);
       setConversionResult(null);
       setConversionError(null);
@@ -627,6 +741,14 @@ export function MenuWindow() {
         result = await invoke<ConversionResult>("compress_pdf", {
           preset: compressionPreset,
         });
+      } else if (selectedOperation?.id === "pdf.rotate_pages") {
+        const changes = Object.entries(rotateTurns).map(([page, turns]) => ({
+          page: Number(page),
+          turns,
+        }));
+        result = await invoke<ConversionResult>("rotate_pages", {
+          rotations: changes,
+        });
       } else if (
         selectedOperation?.id === "pdf.extract_pages" ||
         selectedOperation?.id === "pdf.delete_pages"
@@ -646,11 +768,36 @@ export function MenuWindow() {
       }
       setConversionResult(result);
     } catch (error) {
-      setConversionError(String(error));
+      const message = String(error);
+      if (message.toLowerCase().includes("cancelled")) {
+        setConversionError(null);
+      } else {
+        setConversionError(message);
+      }
     } finally {
       setIsConverting(false);
+      setIsCancellingOperation(false);
     }
   };
+
+  const cancelCurrentOperation = async () => {
+    if (isCancellingOperation || !operationProgress || operationProgress.status !== "running") {
+      return;
+    }
+
+    setIsCancellingOperation(true);
+    try {
+      await invoke("cancel_operation", { operationId: operationProgress.operationId });
+    } catch (error) {
+      setIsCancellingOperation(false);
+      setConversionError(String(error));
+    }
+  };
+
+  useEffect(() => {
+    if (!operationProgress || operationProgress.status === "running") return;
+    setIsCancellingOperation(false);
+  }, [operationProgress]);
 
   const runResultAction = async (
     command: "reveal_output" | "open_output" | "open_output_directory",
@@ -673,6 +820,10 @@ export function MenuWindow() {
       setStage("configure");
     } else if (selectedOperation?.id === "pdf.compress") {
       setStage("compression");
+    } else if (selectedOperation?.id === "pdf.rotate_pages") {
+      setOutputInfo(null);
+      setOutputError(null);
+      setStage("preview");
     } else if (
       selectedOperation?.id === "pdf.extract_pages" ||
       selectedOperation?.id === "pdf.delete_pages"
@@ -747,6 +898,11 @@ export function MenuWindow() {
     selectedOperation !== null &&
     pageSource !== null &&
     inputSelection !== null;
+  const showPreview =
+    stage === "preview" &&
+    selectedOperation !== null &&
+    rotateSource !== null &&
+    inputSelection !== null;
   const showOutput =
     stage === "output" && selectedOperation !== null && inputSelection !== null;
   const isSplit = selectedOperation?.id === "pdf.split";
@@ -754,15 +910,17 @@ export function MenuWindow() {
   const isCompress = selectedOperation?.id === "pdf.compress";
   const isExtractPages = selectedOperation?.id === "pdf.extract_pages";
   const isDeletePages = selectedOperation?.id === "pdf.delete_pages";
+  const isRotate = selectedOperation?.id === "pdf.rotate_pages";
   const isPageSelection = isExtractPages || isDeletePages;
   const pageSelectionMode: PageSelectionMode | null = isExtractPages
     ? "extract"
     : isDeletePages
       ? "delete"
       : null;
-  const minFiles = isSplit || isCompress || isPageSelection ? 1 : isMerge ? 2 : 1;
+  const minFiles =
+    isSplit || isCompress || isPageSelection || isRotate ? 1 : isMerge ? 2 : 1;
   const fileNoun =
-    isSplit || isCompress || isPageSelection
+    isSplit || isCompress || isPageSelection || isRotate
       ? "PDF"
       : isMerge
         ? "PDFs"
@@ -773,7 +931,9 @@ export function MenuWindow() {
       ? "Choose preset"
       : isPageSelection
         ? "Choose pages"
-        : undefined;
+        : isRotate
+          ? "Preview pages"
+          : undefined;
 
   return (
     <main
@@ -807,7 +967,9 @@ export function MenuWindow() {
                 ? isInspectingCompress
                 : isPageSelection
                   ? isInspectingPages
-                  : false
+                  : isRotate
+                    ? isInspectingRotate
+                    : false
           }
           isPicking={isPicking}
           isDropMode={isDropMode}
@@ -828,6 +990,8 @@ export function MenuWindow() {
               void beginCompressionSetup();
             } else if (isPageSelection) {
               void beginPageSelectionSetup();
+            } else if (isRotate) {
+              void beginRotateSetup();
             } else {
               setStage("review");
             }
@@ -916,6 +1080,24 @@ export function MenuWindow() {
           onContinue={() => setStage("output")}
           onDismiss={dismiss}
         />
+      ) : showPreview ? (
+        <RotatePreview
+          source={rotateSource}
+          selectedPages={rotateSelectedPages}
+          rotations={rotateTurns}
+          categoryIcon={selectedAction?.icon}
+          onTogglePage={toggleRotatePage}
+          onSelectAll={() =>
+            setRotateSelectedPages(
+              new Set(Array.from({ length: rotateSource.pages }, (_, i) => i + 1)),
+            )
+          }
+          onClearSelection={() => setRotateSelectedPages(new Set())}
+          onRotateSelected={rotateSelectedPagesNow}
+          onBack={() => setStage("input")}
+          onReview={() => setStage("output")}
+          onDismiss={dismiss}
+        />
       ) : showOutput ? (
         <OutputPanel
           category={selectedAction}
@@ -932,13 +1114,19 @@ export function MenuWindow() {
           compressSource={compressSource}
           pageSelectionMode={pageSelectionMode}
           pagePlan={pagePlan}
+          isRotate={isRotate}
+          rotateSource={rotateSource}
+          rotateTurns={rotateTurns}
           splitMode={splitMode}
           splitPlan={splitPlan}
+          progress={operationProgress}
           result={conversionResult}
           error={conversionError ?? outputError}
           resultError={resultActionError}
+          isCancellingOperation={isCancellingOperation}
           onChooseOutput={() => void chooseOutput()}
           onConvert={() => void convert()}
+          onCancelOperation={() => void cancelCurrentOperation()}
           onReveal={() => void runResultAction("reveal_output")}
           onOpen={() => void runResultAction("open_output")}
           onOpenFolder={() => void runResultAction("open_output_directory")}

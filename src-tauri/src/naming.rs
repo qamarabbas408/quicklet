@@ -20,6 +20,7 @@ pub fn default_output_name(
         "pdf.merge" => "Merge".to_string(),
         "pdf.extract_pages" => "Extract".to_string(),
         "pdf.delete_pages" => "Delete-Pages".to_string(),
+        "pdf.rotate_pages" => "Rotate".to_string(),
         "pdf.compress" => {
             format!("Compress-{}", compression_preset?.label())
         }
@@ -129,6 +130,10 @@ mod tests {
             Some("Quicklet-Delete-Pages-20261024-153045.pdf")
         );
         assert_eq!(
+            default_output_name("pdf.rotate_pages", None, now).as_deref(),
+            Some("Quicklet-Rotate-20261024-153045.pdf")
+        );
+        assert_eq!(
             default_output_name("pdf.compress", Some(CompressionPreset::Light), now).as_deref(),
             Some("Quicklet-Compress-Light-20261024-153045.pdf")
         );
@@ -176,6 +181,7 @@ mod tests {
             default_output_name("pdf.merge", None, now).unwrap(),
             default_output_name("pdf.extract_pages", None, now).unwrap(),
             default_output_name("pdf.delete_pages", None, now).unwrap(),
+            default_output_name("pdf.rotate_pages", None, now).unwrap(),
             default_output_name("pdf.compress", Some(CompressionPreset::Balanced), now).unwrap(),
         ];
 

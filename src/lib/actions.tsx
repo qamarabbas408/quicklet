@@ -103,6 +103,40 @@ export type PageSelectionPlan = {
   outputCount: number;
 };
 
+export type RotateSourceInfo = {
+  name: string;
+  pages: number;
+  bytes: number;
+  rotations: number[];
+  hasSignature: boolean;
+  maxPages: number;
+  maxInputBytes: number;
+};
+
+export type RotateThumbnailRequest = {
+  page: number;
+  turns: number;
+};
+
+export type RotateThumbnail = {
+  page: number;
+  sourceRotation: number;
+  effectiveRotation: number;
+  width: number;
+  height: number;
+  pngBase64: string;
+};
+
+export type RotatePreviewBatch = {
+  pageCount: number;
+  thumbnails: RotateThumbnail[];
+};
+
+export type RotateChange = {
+  page: number;
+  turns: number;
+};
+
 export type CompressionReport = {
   originalBytes: number;
   outputBytes: number;
@@ -121,4 +155,30 @@ export type ConversionResult = {
   directory: string;
   files?: ConversionFile[];
   compression?: CompressionReport;
+};
+
+export type OperationProgressStatus =
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export type OperationProgressOutput = {
+  name?: string;
+  directory?: string;
+  path?: string;
+};
+
+export type OperationProgress = {
+  operationId: string;
+  status: OperationProgressStatus;
+  stage: string;
+  message: string;
+  determinate: boolean;
+  completed?: number;
+  total?: number;
+  unit?: "pages" | "files" | "images" | "bytes" | string;
+  etaSeconds?: number;
+  error?: string;
+  output?: OperationProgressOutput;
 };

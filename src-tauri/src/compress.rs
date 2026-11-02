@@ -21,6 +21,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use image::codecs::jpeg::JpegEncoder;
 use image::{
@@ -115,6 +116,7 @@ pub enum CompressError {
     OutputDirectoryInvalid { path: PathBuf },
     OutputWrite { path: PathBuf, source: io::Error },
     OutputValidation { path: PathBuf, reason: String },
+    Cancelled { path: PathBuf, reason: String },
 }
 
 impl fmt::Display for CompressError {
@@ -185,6 +187,11 @@ impl fmt::Display for CompressError {
                 "The generated PDF could not be validated: {}: {reason}",
                 path.display()
             ),
+            Self::Cancelled { path, reason } => write!(
+                formatter,
+                "Compression cancelled for {}: {reason}",
+                path.display()
+            ),
         }
     }
 }
@@ -229,7 +236,8 @@ pub fn compress_pdf(
     output: &Path,
     preset: CompressionPreset,
 ) -> Result<CompressOutcome, CompressError> {
-    compress(input, output, preset, false)
+    let mut noop = |_stage: &str, _completed: u64, _total: u64| {};
+    compress(input, output, preset, false, Some(&mut noop), None)
 }
 
 /// Like [`compress_pdf`], but atomically replaces an existing destination.
@@ -240,29 +248,115 @@ pub fn compress_pdf_with_overwrite(
     output: &Path,
     preset: CompressionPreset,
 ) -> Result<CompressOutcome, CompressError> {
-    compress(input, output, preset, true)
+    let mut noop = |_stage: &str, _completed: u64, _total: u64| {};
+    compress(input, output, preset, true, Some(&mut noop), None)
 }
 
-fn compress(
+pub fn compress_pdf_with_progress<F>(
+    input: &Path,
+    output: &Path,
+    preset: CompressionPreset,
+    mut on_progress: F,
+) -> Result<CompressOutcome, CompressError>
+where
+    F: FnMut(&str, u64, u64),
+{
+    compress(input, output, preset, false, Some(&mut on_progress), None)
+}
+
+pub fn compress_pdf_with_overwrite_and_progress<F>(
+    input: &Path,
+    output: &Path,
+    preset: CompressionPreset,
+    mut on_progress: F,
+) -> Result<CompressOutcome, CompressError>
+where
+    F: FnMut(&str, u64, u64),
+{
+    compress(input, output, preset, true, Some(&mut on_progress), None)
+}
+
+pub fn compress_pdf_with_overwrite_and_progress_cancelable<F>(
+    input: &Path,
+    output: &Path,
+    preset: CompressionPreset,
+    cancelled: &AtomicBool,
+    mut on_progress: F,
+) -> Result<CompressOutcome, CompressError>
+where
+    F: FnMut(&str, u64, u64),
+{
+    compress(input, output, preset, true, Some(&mut on_progress), Some(cancelled))
+}
+
+fn compress<F>(
     input: &Path,
     output: &Path,
     preset: CompressionPreset,
     allow_overwrite: bool,
-) -> Result<CompressOutcome, CompressError> {
+    mut on_progress: Option<&mut F>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<CompressOutcome, CompressError>
+where
+    F: FnMut(&str, u64, u64),
+{
+    check_cancelled(cancelled, output)?;
+
     let mut loaded = load_document(input)?;
     validate_output(input, output, allow_overwrite)?;
+    check_cancelled(cancelled, output)?;
 
     let original_bytes = loaded.original_bytes;
     let original_size = original_bytes.len() as u64;
     let mut image_stats = ImageStats::default();
 
     let font_programs = font_program_ids(&loaded.document);
-    compress_streams(&mut loaded.document, &font_programs);
+    let stream_total = loaded.document.objects.len() as u64;
+    let image_total = loaded
+        .document
+        .objects
+        .values()
+        .filter(|object| is_image_stream(object))
+        .count() as u64;
+
+    compress_streams_with_progress(
+        &mut loaded.document,
+        &font_programs,
+        |completed| {
+            if let Some(on_progress) = on_progress.as_mut() {
+                on_progress("streams", completed, stream_total);
+            }
+        },
+        cancelled,
+        output,
+    )?;
     if let Some(quality) = preset.image_quality() {
-        image_stats = recompress_images(&mut loaded.document, quality);
+        image_stats = recompress_images_with_progress(
+            &mut loaded.document,
+            quality,
+            |completed| {
+                if let Some(on_progress) = on_progress.as_mut() {
+                    on_progress("images", completed, image_total.max(1));
+                }
+            },
+            cancelled,
+            output,
+        )?;
+    } else {
+        if let Some(on_progress) = on_progress.as_mut() {
+            on_progress("images", image_total.max(1), image_total.max(1));
+        }
     }
 
-    let mut candidate = save_modern(&mut loaded.document, input)?;
+    if let Some(on_progress) = on_progress.as_mut() {
+        on_progress("saving", 0, 1);
+    }
+
+    if let Some(on_progress) = on_progress.as_mut() {
+        on_progress("validating", 0, 1);
+    }
+
+    let mut candidate = save_modern(&mut loaded.document, input, cancelled, output)?;
     let status = if candidate.len() as u64 >= original_size {
         candidate = original_bytes;
         CompressionStatus::NoReduction
@@ -270,7 +364,16 @@ fn compress(
         CompressionStatus::Reduced
     };
 
-    write_safely(output, &candidate, allow_overwrite, loaded.pages)?;
+    if let Some(on_progress) = on_progress.as_mut() {
+        on_progress("saving", 1, 1);
+    }
+
+    if let Some(on_progress) = on_progress.as_mut() {
+        on_progress("finalizing", 0, 1);
+    }
+
+    check_cancelled(cancelled, output)?;
+    write_safely(output, &candidate, allow_overwrite, loaded.pages, cancelled)?;
 
     let output_size = candidate.len() as u64;
     let saved_bytes = if status == CompressionStatus::NoReduction {
@@ -505,9 +608,23 @@ fn validate_output(
     Ok(())
 }
 
-fn compress_streams(document: &mut Document, font_programs: &HashSet<ObjectId>) {
+fn compress_streams_with_progress<F>(
+    document: &mut Document,
+    font_programs: &HashSet<ObjectId>,
+    mut on_progress: F,
+    cancelled: Option<&AtomicBool>,
+    path: &Path,
+) -> Result<(), CompressError>
+where
+    F: FnMut(u64),
+{
+    let total = document.objects.len() as u64;
+    let mut completed = 0_u64;
     for (id, object) in document.objects.iter_mut() {
+        check_cancelled(cancelled, path)?;
         let Object::Stream(stream) = object else {
+            completed += 1;
+            on_progress(completed.min(total));
             continue;
         };
         if !stream.allows_compression
@@ -515,11 +632,16 @@ fn compress_streams(document: &mut Document, font_programs: &HashSet<ObjectId>) 
             || font_programs.contains(id)
             || is_font_program(&stream.dict)
         {
+            completed += 1;
+            on_progress(completed.min(total));
             continue;
         }
 
         let _ = stream.compress();
+        completed += 1;
+        on_progress(completed.min(total));
     }
+    Ok(())
 }
 
 fn font_program_ids(document: &Document) -> HashSet<ObjectId> {
@@ -543,15 +665,33 @@ fn is_font_program(dictionary: &Dictionary) -> bool {
         || dictionary.get(b"Length3").is_ok()
 }
 
-fn recompress_images(document: &mut Document, quality: u8) -> ImageStats {
+fn recompress_images_with_progress<F>(
+    document: &mut Document,
+    quality: u8,
+    mut on_progress: F,
+    cancelled: Option<&AtomicBool>,
+    path: &Path,
+) -> Result<ImageStats, CompressError>
+where
+    F: FnMut(u64),
+{
     let mut stats = ImageStats::default();
     let masks = mask_object_ids(document);
+    let total = document
+        .objects
+        .values()
+        .filter(|object| is_image_stream(object))
+        .count() as u64;
+    let mut completed = 0_u64;
 
     for (id, object) in document.objects.iter_mut() {
+        check_cancelled(cancelled, path)?;
         if !is_image_stream(object) {
             continue;
         }
         let Object::Stream(stream) = object else {
+            completed += 1;
+            on_progress(completed.min(total));
             continue;
         };
 
@@ -559,11 +699,15 @@ fn recompress_images(document: &mut Document, quality: u8) -> ImageStats {
 
         if masks.contains(id) {
             stats.skipped += 1;
+            completed += 1;
+            on_progress(completed.min(total));
             continue;
         }
 
         let Some(candidate) = encode_smaller_jpeg(stream, quality) else {
             stats.skipped += 1;
+            completed += 1;
+            on_progress(completed.min(total));
             continue;
         };
 
@@ -574,6 +718,8 @@ fn recompress_images(document: &mut Document, quality: u8) -> ImageStats {
             || saving * 100 < original_size * MIN_IMAGE_SAVING_PERCENT
         {
             stats.skipped += 1;
+            completed += 1;
+            on_progress(completed.min(total));
             continue;
         }
 
@@ -586,9 +732,11 @@ fn recompress_images(document: &mut Document, quality: u8) -> ImageStats {
         stream.dict.set("BitsPerComponent", 8);
         stream.set_content(candidate);
         stats.recompressed += 1;
+        completed += 1;
+        on_progress(completed.min(total));
     }
 
-    stats
+    Ok(stats)
 }
 
 fn mask_object_ids(document: &Document) -> HashSet<ObjectId> {
@@ -749,7 +897,13 @@ fn image_color_space(stream: &Stream) -> Option<&[u8]> {
     }
 }
 
-fn save_modern(document: &mut Document, input: &Path) -> Result<Vec<u8>, CompressError> {
+fn save_modern(
+    document: &mut Document,
+    input: &Path,
+    cancelled: Option<&AtomicBool>,
+    output: &Path,
+) -> Result<Vec<u8>, CompressError> {
+    check_cancelled(cancelled, output)?;
     let mut bytes = Vec::new();
     document
         .save_with_options(
@@ -764,6 +918,7 @@ fn save_modern(document: &mut Document, input: &Path) -> Result<Vec<u8>, Compres
             path: input.to_path_buf(),
             reason: error.to_string(),
         })?;
+    check_cancelled(cancelled, output)?;
     Ok(bytes)
 }
 
@@ -772,6 +927,7 @@ fn write_safely(
     bytes: &[u8],
     allow_overwrite: bool,
     expected_pages: usize,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<(), CompressError> {
     let parent = target
         .parent()
@@ -783,19 +939,23 @@ fn write_safely(
         source,
     })?;
 
+    check_cancelled(cancelled, target)?;
     temp.write_all(bytes)
         .map_err(|source| CompressError::OutputWrite {
             path: target.to_path_buf(),
             source,
         })?;
+    check_cancelled(cancelled, target)?;
     temp.as_file()
         .sync_all()
         .map_err(|source| CompressError::OutputWrite {
             path: target.to_path_buf(),
             source,
         })?;
+    check_cancelled(cancelled, target)?;
 
-    validate_written_pdf(temp.path(), expected_pages, target)?;
+    validate_written_pdf(temp.path(), expected_pages, target, cancelled)?;
+    check_cancelled(cancelled, target)?;
 
     let persisted = if allow_overwrite {
         temp.persist(target)
@@ -830,7 +990,9 @@ fn validate_written_pdf(
     temp: &Path,
     expected_pages: usize,
     target: &Path,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<(), CompressError> {
+    check_cancelled(cancelled, target)?;
     let document = Document::load(temp).map_err(|error| CompressError::OutputValidation {
         path: target.to_path_buf(),
         reason: error.to_string(),
@@ -849,6 +1011,18 @@ fn validate_written_pdf(
         });
     }
     Ok(())
+}
+
+fn check_cancelled(cancelled: Option<&AtomicBool>, path: &Path) -> Result<(), CompressError> {
+    let Some(cancelled) = cancelled else { return Ok(()); };
+    if cancelled.load(Ordering::SeqCst) {
+        Err(CompressError::Cancelled {
+            path: path.to_path_buf(),
+            reason: "user requested cancellation".to_string(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn has_digital_signature(document: &Document) -> bool {
@@ -1941,7 +2115,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let target = dir.path().join("invalid.pdf");
 
-        let error = write_safely(&target, b"not a pdf", false, 1).unwrap_err();
+        let error = write_safely(&target, b"not a pdf", false, 1, None).unwrap_err();
         assert!(matches!(error, CompressError::OutputValidation { .. }));
         assert!(!target.exists());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
