@@ -1,8 +1,9 @@
 [package]
 name = "quicklet"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Desktop utility for file conversion and PDF operations."
+authors = ["Qamar Abbas"]
+homepage = "https://thedigiorb.com"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

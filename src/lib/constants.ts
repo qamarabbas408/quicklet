@@ -1,6 +1,11 @@
 import { isTauri } from "@tauri-apps/api/core";
+import packageJson from "../../package.json";
 
 export const APP_NAME = "Quicklet";
+export const APP_VERSION = packageJson.version;
+export const APP_DEVELOPER = "Qamar Abbas";
+export const APP_COMPANY = "TheDigiOrb";
+export const APP_WEBSITE = "https://thedigiorb.com";
 
 export const MENU_WINDOW_LABEL = "main";
 export const DEV_LAUNCHER_WINDOW_LABEL = "dev-launcher";

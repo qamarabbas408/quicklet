@@ -519,3 +519,83 @@ body {
 .rotate-page-retry:hover {
   background: rgba(255, 255, 255, 0.14);
 }
+
+.about-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10px 4px 4px;
+  text-align: center;
+}
+
+.about-logo {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 76px;
+  height: 76px;
+  border-radius: 22px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background:
+    radial-gradient(circle at 50% 30%, rgba(255, 255, 255, 0.1), transparent 70%),
+    rgba(255, 255, 255, 0.045);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 12px 30px -14px rgba(0, 0, 0, 0.8);
+}
+
+.about-details {
+  display: flex;
+  flex-direction: column;
+  margin: 4px 0 0;
+  padding: 4px 2px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.about-detail-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 7px 2px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.about-detail-row:last-child {
+  border-bottom: 0;
+}
+
+.about-detail-row dt {
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.about-detail-row dd {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.82);
+}
+
+.about-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: rgba(147, 197, 253, 0.95);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: rgba(147, 197, 253, 0.35);
+  text-underline-offset: 2px;
+}
+
+.about-link:hover {
+  color: rgba(191, 219, 254, 1);
+  text-decoration-color: rgba(191, 219, 254, 0.7);
+}
+
+.about-link:focus-visible {
+  outline: 2px solid rgba(147, 197, 253, 0.55);
+  outline-offset: 2px;
+  border-radius: 2px;
+}

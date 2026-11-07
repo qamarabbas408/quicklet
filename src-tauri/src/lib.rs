@@ -2463,6 +2463,13 @@ fn category_actions(category_id: &str) -> Vec<ActionInfo> {
         )],
         "settings" => vec![
             action(
+                "settings.about",
+                "About Quicklet",
+                "Version and product information",
+                true,
+                None,
+            ),
+            action(
                 "settings.preferences",
                 "Preferences",
                 "Appearance and behavior",
@@ -3110,6 +3117,18 @@ mod tests {
                     .any(|action| action.id == id && action.enabled)
             );
         }
+
+        let settings_actions = super::category_actions("settings");
+        assert!(
+            settings_actions
+                .iter()
+                .any(|action| action.id == "settings.about" && action.enabled)
+        );
+        assert!(
+            settings_actions
+                .iter()
+                .any(|action| action.id == "settings.preferences" && !action.enabled)
+        );
     }
 
     #[test]
