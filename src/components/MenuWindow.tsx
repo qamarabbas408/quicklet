@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { AboutPanel } from "./AboutPanel";
 import { ActionList } from "./ActionList";
 import { CompressionSettings } from "./CompressionSettings";
 import { FileConfirmation } from "./FileConfirmation";
@@ -33,6 +34,7 @@ import type { InputSelection } from "../lib/input";
 type Stage =
   | "radial"
   | "actions"
+  | "about"
   | "input"
   | "review"
   | "configure"
@@ -544,6 +546,12 @@ export function MenuWindow() {
   }, []);
 
   const chooseOperation = async (action: ActionInfo) => {
+    if (action.id === "settings.about") {
+      setSelectedOperation(action);
+      setStage("about");
+      return;
+    }
+
     setActionError(null);
     setConversionResult(null);
     setConversionError(null);
@@ -878,6 +886,8 @@ export function MenuWindow() {
     setIsOpen(true);
   };
 
+  const showAbout =
+    stage === "about" && selectedOperation?.id === "settings.about";
   const showActions = stage === "actions" && selectedAction !== null;
   const showInput =
     stage === "input" && selectedOperation !== null && inputSelection !== null;
@@ -941,7 +951,9 @@ export function MenuWindow() {
       onPointerDown={keepMenuAlive}
       onPointerMove={keepMenuAlive}
     >
-      {showActions ? (
+      {showAbout ? (
+        <AboutPanel onBack={backToActions} onDismiss={dismiss} />
+      ) : showActions ? (
         <ActionList
           category={selectedAction}
           actions={actions}

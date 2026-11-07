@@ -5,10 +5,13 @@
 - Preserve meaning, required details, and readability; do not over-compress or remove information needed by a person or agent.
 - Keep existing structure and conventions unless the task requires changing them.
 ## App versioning
-The app version must be kept in sync across **all four** files:
+Use `npm run version:set -- X.Y.Z` to keep the app version synchronized across:
 - `package.json` → `"version"`
+- `package-lock.json` → root and `packages[""]` versions
 - `src-tauri/tauri.conf.json` → `"version"`
 - `src-tauri/Cargo.toml` → `version`
 - `src-tauri/Cargo.lock` → the `[[package]] name = "quicklet"` entry's `version`
-When bumping the version, update all four to the same value and commit the
-change in one commit (e.g. `Bump app version to X.Y.Z`).
+
+`npm run version:check` runs before dev/build/Tauri commands. Bump the separate
+macOS build number with `npm run version:bump-build` when packaging a release.
+Commit version changes in one commit (e.g. `Bump app version to X.Y.Z`).
