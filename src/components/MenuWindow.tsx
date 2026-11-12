@@ -737,6 +737,7 @@ export function MenuWindow() {
     setConversionError(null);
     setConversionResult(null);
     setResultActionError(null);
+    setOperationProgress(null);
 
     try {
       let result: ConversionResult;

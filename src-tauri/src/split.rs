@@ -25,6 +25,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 use tempfile::NamedTempFile;
 
 use crate::naming;
+use crate::progress::{self, Progress};
 
 pub const MAX_SPLIT_PAGES: usize = 2_000;
 pub const MAX_SPLIT_OUTPUTS: usize = 500;
@@ -106,6 +107,7 @@ pub enum SplitError {
     OutputMatchesInput { path: PathBuf },
     OutputCollision { paths: Vec<PathBuf> },
     OutputWrite { path: PathBuf, source: io::Error },
+    Cancelled,
 }
 
 impl fmt::Display for SplitError {
@@ -183,7 +185,20 @@ impl fmt::Display for SplitError {
             Self::OutputWrite { path, source } => {
                 write!(formatter, "Could not write {}: {source}", path.display())
             }
+            Self::Cancelled => write!(formatter, "Split cancelled."),
         }
+    }
+}
+
+impl From<progress::Cancelled> for SplitError {
+    fn from(_: progress::Cancelled) -> Self {
+        Self::Cancelled
+    }
+}
+
+impl progress::OperationError for SplitError {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
     }
 }
 
@@ -308,6 +323,19 @@ pub fn split_pdf(
     mode: SplitMode,
     ranges: &str,
 ) -> Result<SplitOutcome, SplitError> {
+    split_pdf_with_progress(input, output_directory, mode, ranges, &mut ())
+}
+
+/// Like [`split_pdf`], reporting `loading` and `writing` per output file. If
+/// `progress` cancels, files already written by this call are removed.
+pub fn split_pdf_with_progress(
+    input: &Path,
+    output_directory: &Path,
+    mode: SplitMode,
+    ranges: &str,
+    progress: &mut dyn Progress,
+) -> Result<SplitOutcome, SplitError> {
+    progress.step("loading", 0, 0)?;
     let (document, _) = load_document(input)?;
     let entries = page_entries(&document, input)?;
     validate_page_count(entries.len())?;
@@ -326,7 +354,13 @@ pub fn split_pdf(
     let mut total_bytes = 0u64;
     let mut total_pages = 0usize;
 
-    for output in &plan.outputs {
+    let total = plan.outputs.len();
+    for (index, output) in plan.outputs.iter().enumerate() {
+        if let Err(cancelled) = progress.step("writing", index, total) {
+            cleanup_created(&created);
+            return Err(cancelled.into());
+        }
+
         let target = output_directory.join(&output.name);
         let bytes = match build_output(&document, &entries, &output.pages, input) {
             Ok(bytes) => bytes,
@@ -376,6 +410,19 @@ pub fn write_page_selection(
     pages: &[usize],
     allow_overwrite: bool,
 ) -> Result<PageSelectionOutcome, SplitError> {
+    write_page_selection_with_progress(input, output, pages, allow_overwrite, &mut ())
+}
+
+/// Like [`write_page_selection`], reporting `loading` and `building`, and
+/// stopping before writing if `progress` cancels.
+pub fn write_page_selection_with_progress(
+    input: &Path,
+    output: &Path,
+    pages: &[usize],
+    allow_overwrite: bool,
+    progress: &mut dyn Progress,
+) -> Result<PageSelectionOutcome, SplitError> {
+    progress.step("loading", 0, 0)?;
     let (document, _) = load_document(input)?;
     let entries = page_entries(&document, input)?;
     validate_page_count(entries.len())?;
@@ -404,6 +451,7 @@ pub fn write_page_selection(
 
     validate_single_output(input, output, allow_overwrite)?;
 
+    progress.step("building", 0, 0)?;
     let bytes = build_output(&document, &entries, pages, input)?;
     write_safely(output, &bytes, allow_overwrite)?;
 
@@ -1933,5 +1981,35 @@ mod tests {
         assert!(page_text(&document, id).contains("Nested inherited page"));
         assert_eq!(media_box(&document, id), (595.0, 842.0));
         assert!(page_dictionary(&document, id).get(b"Resources").is_ok());
+    }
+
+    #[test]
+    fn removes_written_files_when_cancelled_midway() {
+        use crate::progress::testing::Recorder;
+
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("source.pdf");
+        write_test_pdf(
+            &input,
+            &[
+                TestPage::new(595.0, 842.0, 0, "One", None),
+                TestPage::new(595.0, 842.0, 0, "Two", None),
+                TestPage::new(595.0, 842.0, 0, "Three", None),
+            ],
+        );
+        let output_directory = dir.path().join("out");
+        fs::create_dir(&output_directory).unwrap();
+
+        // Steps: loading, writing 0/3, writing 1/3 (cancelled after one file).
+        let result = split_pdf_with_progress(
+            &input,
+            &output_directory,
+            SplitMode::EveryPage,
+            "",
+            &mut Recorder::cancelling_at(2),
+        );
+
+        assert!(matches!(result, Err(SplitError::Cancelled)));
+        assert_eq!(fs::read_dir(&output_directory).unwrap().count(), 0);
     }
 }

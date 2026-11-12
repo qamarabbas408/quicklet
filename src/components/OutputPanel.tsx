@@ -120,10 +120,8 @@ export function OutputPanel({
               ? "Extracting pages…"
               : "Deleting pages…"
             : "Creating PDF…";
-  const progressMessage =
-    progress?.status === "cancelled"
-      ? "Compression cancelled"
-      : progress?.message ?? busyLabel;
+  const isOperationRunning = progress?.status === "running";
+  const progressMessage = progress?.message ?? busyLabel;
   const progressCompleted =
     progress && typeof progress.completed === "number" ? progress.completed : null;
   const progressTotal =
@@ -581,7 +579,11 @@ export function OutputPanel({
               </p>
             )}
 
-            {(isConverting || progress) && (
+            {progress?.status === "cancelled" && !isConverting && (
+              <p className="text-[11px] text-white/45">{progress.message}</p>
+            )}
+
+            {(isConverting || isOperationRunning) && (
               <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
                 <div className="mb-2 flex items-center justify-between gap-3 text-[11px]">
                   <span className="flex items-center gap-2 text-white/70">
@@ -593,7 +595,7 @@ export function OutputPanel({
                       {Math.round(progressPercent)}%
                     </span>
                   ) : null}
-                  {isCompress && progress?.status === "running" && !result ? (
+                  {isOperationRunning && !result ? (
                     <button
                       type="button"
                       className="rounded-md border border-white/15 bg-white/5 px-2 py-1 text-[10px] font-medium text-white/75 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"

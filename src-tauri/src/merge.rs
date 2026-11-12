@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use tempfile::NamedTempFile;
 
+use crate::progress::{self, Progress};
+
 pub const MAX_MERGE_INPUTS: usize = 8;
 const MAX_PAGE_TREE_DEPTH: usize = 256;
 
@@ -35,6 +37,7 @@ pub enum MergeError {
     OutputExists { path: PathBuf },
     OutputDirectoryInvalid { path: PathBuf },
     OutputWrite { path: PathBuf, source: io::Error },
+    Cancelled,
 }
 
 impl fmt::Display for MergeError {
@@ -83,7 +86,20 @@ impl fmt::Display for MergeError {
             Self::OutputWrite { path, source } => {
                 write!(formatter, "Could not write {}: {source}", path.display())
             }
+            Self::Cancelled => write!(formatter, "Merge cancelled."),
         }
+    }
+}
+
+impl From<progress::Cancelled> for MergeError {
+    fn from(_: progress::Cancelled) -> Self {
+        Self::Cancelled
+    }
+}
+
+impl progress::OperationError for MergeError {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
     }
 }
 
@@ -132,7 +148,7 @@ impl InheritedAttributes {
 /// Merges complete PDFs in the given order. Existing output files are never
 /// overwritten.
 pub fn merge_pdfs(inputs: &[PathBuf], output: &Path) -> Result<MergeOutcome, MergeError> {
-    merge(inputs, output, false)
+    merge(inputs, output, false, &mut ())
 }
 
 /// Like [`merge_pdfs`], but atomically replaces an existing output file.
@@ -143,13 +159,24 @@ pub fn merge_pdfs_with_overwrite(
     inputs: &[PathBuf],
     output: &Path,
 ) -> Result<MergeOutcome, MergeError> {
-    merge(inputs, output, true)
+    merge(inputs, output, true, &mut ())
+}
+
+/// Like [`merge_pdfs_with_overwrite`], reporting `loading` and `merging` per
+/// input and `saving`, and stopping before writing if `progress` cancels.
+pub fn merge_pdfs_with_overwrite_and_progress(
+    inputs: &[PathBuf],
+    output: &Path,
+    progress: &mut dyn Progress,
+) -> Result<MergeOutcome, MergeError> {
+    merge(inputs, output, true, progress)
 }
 
 fn merge(
     inputs: &[PathBuf],
     output: &Path,
     allow_overwrite: bool,
+    progress: &mut dyn Progress,
 ) -> Result<MergeOutcome, MergeError> {
     if inputs.len() < 2 {
         return Err(MergeError::TooFewInputs);
@@ -162,16 +189,20 @@ fn merge(
 
     validate_output(output, allow_overwrite)?;
 
-    let mut documents = Vec::with_capacity(inputs.len());
-    for path in inputs {
+    let total = inputs.len();
+    progress.step("loading", 0, total)?;
+    let mut documents = Vec::with_capacity(total);
+    for (index, path) in inputs.iter().enumerate() {
         documents.push(load_document(path)?);
+        progress.step("loading", index + 1, total)?;
     }
 
     let mut merged = Document::with_version("1.7");
     let mut next_id = 1u32;
     let mut page_ids: Vec<ObjectId> = Vec::new();
 
-    for (mut document, source) in documents {
+    progress.step("merging", 0, total)?;
+    for (index, (mut document, source)) in documents.into_iter().enumerate() {
         validate_references(&document, &source)?;
         document.renumber_objects_with(next_id);
         next_id = document.max_id + 1;
@@ -191,6 +222,7 @@ fn merge(
                 }
             }
         }
+        progress.step("merging", index + 1, total)?;
     }
 
     merged.max_id = next_id;
@@ -230,6 +262,7 @@ fn merge(
 
     validate_references(&merged, Path::new("merged output"))?;
 
+    progress.step("saving", 0, 0)?;
     let mut bytes = Vec::new();
     merged
         .save_to(&mut bytes)
@@ -1125,5 +1158,29 @@ mod tests {
             merge_pdfs(&[a, b], &output),
             Err(MergeError::OutputDirectoryInvalid { .. })
         ));
+    }
+
+    #[test]
+    fn writes_nothing_when_cancelled() {
+        use crate::progress::testing::Recorder;
+
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.pdf");
+        let b = dir.path().join("b.pdf");
+        write_test_pdf(&a, &[TestPage::new(595.0, 842.0, 0, "A", None)]);
+        write_test_pdf(&b, &[TestPage::new(595.0, 842.0, 0, "B", None)]);
+
+        let output = dir.path().join("merged.pdf");
+        let mut recorder = Recorder::default();
+        merge_pdfs_with_overwrite_and_progress(&[a.clone(), b.clone()], &output, &mut recorder)
+            .unwrap();
+        assert_eq!(recorder.steps.last(), Some(&("saving", 0, 0)));
+
+        // Stop after both files have loaded, while merging.
+        let cancelled = dir.path().join("cancelled.pdf");
+        let result =
+            merge_pdfs_with_overwrite_and_progress(&[a, b], &cancelled, &mut Recorder::cancelling_at(4));
+        assert!(matches!(result, Err(MergeError::Cancelled)));
+        assert!(!cancelled.exists());
     }
 }

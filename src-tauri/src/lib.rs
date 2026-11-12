@@ -1,23 +1,27 @@
 pub mod compress;
 pub mod merge;
 pub mod naming;
+pub mod operation;
 pub mod organize;
 pub mod pdf;
 pub mod pdf_preview;
+pub mod progress;
 pub mod rotate;
 pub mod split;
 
 use chrono::Local;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
+
+use operation::{OperationTarget, run_operation};
 
 const MENU_WINDOW_LABEL: &str = "main";
 const DEFAULT_MENU_SIZE: f64 = 440.0;
@@ -102,318 +106,6 @@ struct ConversionResult {
     compression: Option<ConversionCompression>,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct OperationProgressOutput {
-    name: Option<String>,
-    directory: Option<String>,
-    path: Option<String>,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct OperationProgressSnapshot {
-    operation_id: String,
-    status: String,
-    stage: String,
-    message: String,
-    determinate: bool,
-    completed: Option<u64>,
-    total: Option<u64>,
-    unit: Option<String>,
-    eta_seconds: Option<u64>,
-    error: Option<String>,
-    output: Option<OperationProgressOutput>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OperationProgressFields {
-    operation_id: String,
-    status: String,
-    stage: String,
-    message: String,
-    determinate: bool,
-    completed: u64,
-    total: u64,
-    unit: Option<String>,
-    eta_seconds: Option<u64>,
-    error: Option<String>,
-    output: Option<OperationProgressOutput>,
-}
-
-impl OperationProgressSnapshot {
-    fn from_fields(fields: OperationProgressFields) -> Self {
-        let completed = if fields.determinate {
-            Some(fields.completed)
-        } else {
-            None
-        };
-        let total = if fields.determinate { Some(fields.total) } else { None };
-        Self {
-            operation_id: fields.operation_id,
-            status: fields.status,
-            stage: fields.stage,
-            message: fields.message,
-            determinate: fields.determinate,
-            completed,
-            total,
-            unit: fields.unit,
-            eta_seconds: fields.eta_seconds,
-            error: fields.error,
-            output: fields.output,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        operation_id: impl Into<String>,
-        status: impl Into<String>,
-        stage: impl Into<String>,
-        message: impl Into<String>,
-        determinate: bool,
-        completed: u64,
-        total: u64,
-        unit: Option<&str>,
-        eta_seconds: Option<u64>,
-        error: Option<String>,
-        output: Option<OperationProgressOutput>,
-    ) -> Self {
-        Self::from_fields(OperationProgressFields {
-            operation_id: operation_id.into(),
-            status: status.into(),
-            stage: stage.into(),
-            message: message.into(),
-            determinate,
-            completed,
-            total,
-            unit: unit.map(str::to_owned),
-            eta_seconds,
-            error,
-            output,
-        })
-    }
-
-    pub fn is_valid_determinate_progress(&self) -> bool {
-        self.determinate
-            && self.completed.is_some()
-            && self.total.is_some()
-            && self.total.filter(|total| *total > 0).is_some()
-            && self
-                .completed
-                .zip(self.total)
-                .is_some_and(|(completed, total)| completed <= total)
-    }
-}
-
-struct CompressionProgressSnapshotInput<'a> {
-    operation_id: &'a str,
-    status: &'a str,
-    stage: &'a str,
-    message: String,
-    completed: u64,
-    total: u64,
-    unit: Option<&'a str>,
-    eta_seconds: Option<u64>,
-    error: Option<String>,
-    output: Option<OperationProgressOutput>,
-}
-
-fn compression_progress_snapshot(input: CompressionProgressSnapshotInput<'_>) -> OperationProgressSnapshot {
-    let is_finalization_stage = matches!(input.stage, "saving" | "validating" | "finalizing");
-    OperationProgressSnapshot::new(
-        input.operation_id,
-        input.status,
-        input.stage,
-        input.message,
-        !is_finalization_stage,
-        if is_finalization_stage { 0 } else { input.completed },
-        if is_finalization_stage { 0 } else { input.total },
-        if is_finalization_stage { None } else { input.unit },
-        if is_finalization_stage { None } else { input.eta_seconds },
-        input.error,
-        input.output,
-    )
-}
-
-#[derive(Default)]
-struct CompressionEtaEstimator {
-    stage: Option<String>,
-    smoothed_rate: Option<f64>,
-    observations: usize,
-}
-
-impl CompressionEtaEstimator {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn record(&mut self, stage: &str, completed: u64, total: u64, elapsed_seconds: f64) -> Option<u64> {
-        if self.stage.as_deref() != Some(stage) {
-            self.stage = Some(stage.to_string());
-            self.smoothed_rate = None;
-            self.observations = 0;
-        }
-
-        if total == 0 || completed == 0 || completed >= total || elapsed_seconds <= 0.0 {
-            return None;
-        }
-
-        let throughput = completed as f64 / elapsed_seconds;
-        let smoothed = match self.smoothed_rate {
-            Some(current) => (current * 0.7) + (throughput * 0.3),
-            None => throughput,
-        };
-        self.smoothed_rate = Some(smoothed);
-        self.observations += 1;
-
-        if self.observations < 2 || !smoothed.is_finite() || smoothed <= 0.0 {
-            return None;
-        }
-
-        let remaining = total.saturating_sub(completed) as f64;
-        let eta = remaining / smoothed;
-        if eta.is_finite() && eta > 0.0 {
-            Some(eta.round() as u64)
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Default)]
-struct OperationCancellationState {
-    tokens: Mutex<HashMap<String, Arc<AtomicBool>>>,
-}
-
-impl OperationCancellationState {
-    #[allow(dead_code)]
-    fn begin(&self, operation_id: &str) -> Arc<AtomicBool> {
-        let token = Arc::new(AtomicBool::new(false));
-        self.tokens
-            .lock()
-            .map(|mut tokens| {
-                tokens.insert(operation_id.to_string(), token.clone());
-            })
-            .ok();
-        token
-    }
-
-    fn request_cancel(&self, operation_id: &str) -> bool {
-        let Some(token) = self.tokens.lock().ok().and_then(|tokens| tokens.get(operation_id).cloned()) else {
-            return false;
-        };
-        token.store(true, Ordering::SeqCst);
-        true
-    }
-
-    #[allow(dead_code)]
-    fn is_cancelled(&self, operation_id: &str) -> bool {
-        self.tokens
-            .lock()
-            .ok()
-            .and_then(|tokens| tokens.get(operation_id).cloned())
-            .is_some_and(|token| token.load(Ordering::SeqCst))
-    }
-
-    fn clear(&self, operation_id: &str) {
-        let _ = self.tokens.lock().map(|mut tokens| {
-            tokens.remove(operation_id);
-        });
-    }
-}
-
-#[derive(Default)]
-struct OperationProgressState {
-    next_id: AtomicU64,
-    current: Mutex<Option<OperationProgressSnapshot>>,
-}
-
-#[allow(dead_code)]
-impl OperationProgressState {
-    fn next_operation_id(&self, operation_type: &str) -> String {
-        let next = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
-        format!("{operation_type}:{next}")
-    }
-
-    fn begin(&self, operation_type: &str, message: &str) -> OperationProgressSnapshot {
-        let operation_id = self.next_operation_id(operation_type);
-        let snapshot = OperationProgressSnapshot::new(
-            operation_id.clone(),
-            "running",
-            "preparing",
-            message,
-            false,
-            0,
-            0,
-            None,
-            None,
-            None,
-            None,
-        );
-        if let Ok(mut current) = self.current.lock() {
-            *current = Some(snapshot.clone());
-        }
-        snapshot
-    }
-
-    fn update(&self, snapshot: OperationProgressSnapshot) {
-        if self.accepts_snapshot(&snapshot)
-            && let Ok(mut current) = self.current.lock()
-        {
-            *current = Some(snapshot.clone());
-        }
-    }
-
-    fn accepts_snapshot(&self, snapshot: &OperationProgressSnapshot) -> bool {
-        let Some(current) = self.current.lock().ok().and_then(|current| current.clone()) else {
-            return true;
-        };
-
-        if current.operation_id != snapshot.operation_id {
-            return false;
-        }
-
-        if let (Some(current_completed), Some(new_completed)) =
-            (current.completed, snapshot.completed)
-            && new_completed < current_completed
-        {
-            return false;
-        }
-
-        if let (Some(current_total), Some(new_total)) = (current.total, snapshot.total)
-            && new_total < current_total
-        {
-            return false;
-        }
-
-        true
-    }
-
-    fn current_operation_id(&self) -> Option<String> {
-        self.current
-            .lock()
-            .ok()
-            .and_then(|current| current.clone())
-            .map(|snapshot| snapshot.operation_id)
-    }
-
-    fn snapshot(&self) -> Option<OperationProgressSnapshot> {
-        self.current.lock().ok().and_then(|current| current.clone())
-    }
-}
-
-fn emit_operation_progress(app: &AppHandle, snapshot: &OperationProgressSnapshot) {
-    let state = app.state::<OperationProgressState>();
-    if !state.accepts_snapshot(snapshot) {
-        return;
-    }
-
-    if let Ok(mut current) = state.current.lock() {
-        *current = Some(snapshot.clone());
-    }
-    let _ = app.emit("operation-progress", snapshot.clone());
-}
-
 struct ConversionBusyGuard {
     app: AppHandle,
 }
@@ -435,36 +127,94 @@ fn ensure_not_converting(state: &InputState) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-fn get_operation_progress(app: AppHandle) -> Option<OperationProgressSnapshot> {
-    app.state::<OperationProgressState>().snapshot()
+const UNAVAILABLE_ACTION: &str = "This action is not available yet.";
+
+fn selected_action(state: &InputState) -> Result<String, String> {
+    state
+        .action_id
+        .lock()
+        .map(|action_id| action_id.clone())
+        .unwrap_or(None)
+        .ok_or_else(|| "Choose an action first.".to_string())
 }
 
-#[tauri::command]
-fn cancel_operation(app: AppHandle, operation_id: Option<String>) -> Result<(), String> {
-    let target = operation_id.or_else(|| app.state::<OperationProgressState>().current_operation_id())
-        .ok_or_else(|| "No active operation to cancel.".to_string())?;
+fn selected_files(state: &InputState) -> Vec<InputFile> {
+    state
+        .files
+        .lock()
+        .map(|files| files.clone())
+        .unwrap_or_default()
+}
 
-    let active = app.state::<OperationCancellationState>().request_cancel(&target);
-    if !active {
-        return Err("No active operation to cancel.".to_string());
+fn selected_output(state: &InputState) -> Result<PathBuf, String> {
+    state
+        .output_path
+        .lock()
+        .map(|output| output.clone())
+        .unwrap_or(None)
+        .ok_or_else(|| "Choose an output destination first.".to_string())
+}
+
+/// Returns the selected files when `action_id` is the active action and no
+/// conversion is running.
+fn action_files(app: &AppHandle, action_id: &str) -> Result<Vec<InputFile>, String> {
+    let state = app.state::<InputState>();
+    ensure_not_converting(&state)?;
+    if selected_action(&state)? != action_id {
+        return Err(UNAVAILABLE_ACTION.to_string());
     }
+    Ok(selected_files(&state))
+}
 
-    let snapshot = OperationProgressSnapshot::new(
-        target,
-        "running",
-        "cancelling",
-        "Cancelling…",
-        false,
-        0,
-        0,
-        None,
-        None,
-        None,
-        None,
-    );
-    emit_operation_progress(&app, &snapshot);
-    Ok(())
+fn single_input_path(app: &AppHandle, action_id: &str, count_error: &str) -> Result<PathBuf, String> {
+    match action_files(app, action_id)?.as_slice() {
+        [file] => Ok(file.path.clone()),
+        _ => Err(count_error.to_string()),
+    }
+}
+
+fn input_paths(files: &[InputFile]) -> Vec<PathBuf> {
+    files.iter().map(|file| file.path.clone()).collect()
+}
+
+fn file_name_and_directory(path: &Path) -> (String, String) {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output.pdf".to_string());
+    let directory = path
+        .parent()
+        .map(|directory| directory.display().to_string())
+        .unwrap_or_default();
+    (name, directory)
+}
+
+fn file_result(output: &Path, pages: usize, bytes_written: u64) -> ConversionResult {
+    let (name, directory) = file_name_and_directory(output);
+    ConversionResult {
+        pages,
+        bytes_written,
+        name,
+        directory,
+        files: None,
+        compression: None,
+    }
+}
+
+/// Forgets the chosen destination and the last result.
+fn clear_outputs(state: &InputState) {
+    if let Ok(mut output_path) = state.output_path.lock() {
+        *output_path = None;
+    }
+    if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
+        *split_output_dir = None;
+    }
+    if let Ok(mut last_output) = state.last_output.lock() {
+        *last_output = None;
+    }
+    if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
+        *last_output_directory = None;
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -867,17 +617,9 @@ async fn choose_output(
         .map(|directory| directory.display().to_string())
         .unwrap_or_default();
 
+    clear_outputs(&state);
     if let Ok(mut output_path) = state.output_path.lock() {
         *output_path = Some(path);
-    }
-    if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
-        *split_output_dir = None;
-    }
-    if let Ok(mut last_output) = state.last_output.lock() {
-        *last_output = None;
-    }
-    if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
-        *last_output_directory = None;
     }
 
     Ok(Some(OutputInfo { name, directory }))
@@ -885,251 +627,46 @@ async fn choose_output(
 
 #[tauri::command]
 async fn convert_to_pdf(app: AppHandle) -> Result<ConversionResult, String> {
-    let (paths, output) = {
-        let state = app.state::<InputState>();
-        ensure_not_converting(&state)?;
+    let files = action_files(&app, "images.convert_to_pdf")?;
+    if files.is_empty() {
+        return Err("Add images before converting.".to_string());
+    }
+    let output = selected_output(&app.state::<InputState>())?;
 
-        let action_id = state
-            .action_id
-            .lock()
-            .map(|action_id| action_id.clone())
-            .unwrap_or(None)
-            .ok_or_else(|| "Choose an action first.".to_string())?;
-
-        if action_id != "images.convert_to_pdf" {
-            return Err("This action is not available yet.".to_string());
-        }
-
-        let files = state
-            .files
-            .lock()
-            .map(|files| files.clone())
-            .unwrap_or_default();
-
-        if files.is_empty() {
-            return Err("Add images before converting.".to_string());
-        }
-
-        let output = state
-            .output_path
-            .lock()
-            .map(|output| output.clone())
-            .unwrap_or(None)
-            .ok_or_else(|| "Choose an output destination first.".to_string())?;
-
-        if state
-            .conversion_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err("A conversion is already running.".to_string());
-        }
-
-        (
-            files
-                .iter()
-                .map(|file| file.path.clone())
-                .collect::<Vec<_>>(),
-            output,
-        )
-    };
-
-    let progress_state = app.state::<OperationProgressState>();
-    let operation = progress_state.begin("images.convert_to_pdf", "Preparing PDF conversion");
-    emit_operation_progress(&app, &operation);
-
-    let progress_app = app.clone();
-    let progress_op_id = operation.operation_id.clone();
+    let paths = input_paths(&files);
     let task_output = output.clone();
-    let task_progress_id = progress_op_id.clone();
-    let joined = tauri::async_runtime::spawn_blocking(move || {
-        let _guard = ConversionBusyGuard { app: progress_app.clone() };
-        pdf::convert_images_to_pdf_with_progress(&paths, &task_output, true, |completed, total, stage| {
-            let message = match stage {
-                "reading" => format!("Reading images {completed}/{total}"),
-                "building" => format!("Building PDF {completed}/{total} pages"),
-                "writing" => "Writing PDF to output".to_string(),
-                _ => "Preparing PDF conversion".to_string(),
-            };
-            let snapshot = OperationProgressSnapshot::new(
-                task_progress_id.clone(),
-                "running",
-                stage,
-                message,
-                true,
-                completed as u64,
-                total as u64,
-                Some("images"),
-                None,
-                None,
-                None,
-            );
-            emit_operation_progress(&progress_app, &snapshot);
-        })
-    }).await;
+    let outcome = run_operation(
+        &app,
+        "images.convert_to_pdf",
+        "Conversion",
+        OperationTarget::File(output.clone()),
+        move |progress| pdf::convert_images_to_pdf_with_progress(&paths, &task_output, true, progress),
+    )
+    .await?;
 
-    let outcome = match joined {
-        Ok(result) => result.map_err(|error| error.to_string())?,
-        Err(error) => {
-            let snapshot = OperationProgressSnapshot::new(
-                progress_op_id.clone(),
-                "failed",
-                "error",
-                format!("PDF conversion failed: {error}"),
-                false,
-                0,
-                0,
-                None,
-                None,
-                Some(format!("PDF conversion failed: {error}")),
-                None,
-            );
-            emit_operation_progress(&app, &snapshot);
-            app.state::<InputState>()
-                .conversion_in_progress
-                .store(false, Ordering::SeqCst);
-            return Err(error.to_string());
-        }
-    };
-
-    if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
-        *last_output = Some(output.clone());
-    }
-    if let Ok(mut last_output_directory) = app.state::<InputState>().last_output_directory.lock() {
-        *last_output_directory = None;
-    }
-
-    let name = output
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "output.pdf".to_string());
-    let directory = output
-        .parent()
-        .map(|directory| directory.display().to_string())
-        .unwrap_or_default();
-
-    let snapshot = OperationProgressSnapshot::new(
-        progress_op_id,
-        "succeeded",
-        "complete",
-        format!("PDF created successfully ({})", name),
-        true,
-        outcome.pages as u64,
-        outcome.pages as u64,
-        Some("pages"),
-        None,
-        None,
-        Some(OperationProgressOutput {
-            name: Some(name.clone()),
-            directory: Some(directory.clone()),
-            path: Some(output.display().to_string()),
-        }),
-    );
-    emit_operation_progress(&app, &snapshot);
-
-    Ok(ConversionResult {
-        pages: outcome.pages,
-        bytes_written: outcome.bytes_written,
-        name,
-        directory,
-        files: None,
-        compression: None,
-    })
+    Ok(file_result(&output, outcome.pages, outcome.bytes_written))
 }
 
 #[tauri::command]
 async fn merge_pdfs(app: AppHandle) -> Result<ConversionResult, String> {
-    let (paths, output) = {
-        let state = app.state::<InputState>();
-        ensure_not_converting(&state)?;
+    let files = action_files(&app, "pdf.merge")?;
+    if files.len() < 2 {
+        return Err("Select at least two PDF files to merge.".to_string());
+    }
+    let output = selected_output(&app.state::<InputState>())?;
 
-        let action_id = state
-            .action_id
-            .lock()
-            .map(|action_id| action_id.clone())
-            .unwrap_or(None)
-            .ok_or_else(|| "Choose an action first.".to_string())?;
-
-        if action_id != "pdf.merge" {
-            return Err("This action is not available yet.".to_string());
-        }
-
-        let files = state
-            .files
-            .lock()
-            .map(|files| files.clone())
-            .unwrap_or_default();
-
-        if files.len() < 2 {
-            return Err("Select at least two PDF files to merge.".to_string());
-        }
-
-        let output = state
-            .output_path
-            .lock()
-            .map(|output| output.clone())
-            .unwrap_or(None)
-            .ok_or_else(|| "Choose an output destination first.".to_string())?;
-
-        if state
-            .conversion_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err("A conversion is already running.".to_string());
-        }
-
-        (
-            files
-                .iter()
-                .map(|file| file.path.clone())
-                .collect::<Vec<_>>(),
-            output,
-        )
-    };
-
-    let guard_app = app.clone();
+    let paths = input_paths(&files);
     let task_output = output.clone();
-    let joined = tauri::async_runtime::spawn_blocking(move || {
-        let _guard = ConversionBusyGuard { app: guard_app };
-        merge::merge_pdfs_with_overwrite(&paths, &task_output)
-    })
-    .await;
+    let outcome = run_operation(
+        &app,
+        "pdf.merge",
+        "Merge",
+        OperationTarget::File(output.clone()),
+        move |progress| merge::merge_pdfs_with_overwrite_and_progress(&paths, &task_output, progress),
+    )
+    .await?;
 
-    let outcome = match joined {
-        Ok(result) => result.map_err(|error| error.to_string())?,
-        Err(error) => {
-            app.state::<InputState>()
-                .conversion_in_progress
-                .store(false, Ordering::SeqCst);
-            return Err(error.to_string());
-        }
-    };
-
-    if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
-        *last_output = Some(output.clone());
-    }
-    if let Ok(mut last_output_directory) = app.state::<InputState>().last_output_directory.lock() {
-        *last_output_directory = None;
-    }
-
-    let name = output
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "output.pdf".to_string());
-    let directory = output
-        .parent()
-        .map(|directory| directory.display().to_string())
-        .unwrap_or_default();
-
-    Ok(ConversionResult {
-        pages: outcome.pages,
-        bytes_written: outcome.bytes_written,
-        name,
-        directory,
-        files: None,
-        compression: None,
-    })
+    Ok(file_result(&output, outcome.pages, outcome.bytes_written))
 }
 
 #[tauri::command]
@@ -1213,17 +750,9 @@ async fn choose_output_directory(
         return Err("Choose an existing folder.".to_string());
     }
 
+    clear_outputs(&state);
     if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
         *split_output_dir = Some(path.clone());
-    }
-    if let Ok(mut output_path) = state.output_path.lock() {
-        *output_path = None;
-    }
-    if let Ok(mut last_output) = state.last_output.lock() {
-        *last_output = None;
-    }
-    if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
-        *last_output_directory = None;
     }
 
     Ok(Some(OutputDirectoryInfo {
@@ -1237,79 +766,32 @@ async fn split_pdf(
     mode: String,
     ranges: String,
 ) -> Result<ConversionResult, String> {
-    let (path, output_directory) = {
-        let state = app.state::<InputState>();
-        ensure_not_converting(&state)?;
-
-        let action_id = state
-            .action_id
-            .lock()
-            .map(|action_id| action_id.clone())
-            .unwrap_or(None)
-            .ok_or_else(|| "Choose an action first.".to_string())?;
-
-        if action_id != "pdf.split" {
-            return Err("This action is not available yet.".to_string());
-        }
-
-        let files = state
-            .files
-            .lock()
-            .map(|files| files.clone())
-            .unwrap_or_default();
-
-        if files.len() != 1 {
-            return Err("Select exactly one PDF to split.".to_string());
-        }
-
-        let output_directory = state
-            .split_output_dir
-            .lock()
-            .map(|directory| directory.clone())
-            .unwrap_or(None)
-            .ok_or_else(|| "Choose an output folder first.".to_string())?;
-
-        if state
-            .conversion_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err("A conversion is already running.".to_string());
-        }
-
-        (files[0].path.clone(), output_directory)
-    };
-
+    let path = split_input_path(&app)?;
+    let output_directory = app
+        .state::<InputState>()
+        .split_output_dir
+        .lock()
+        .map(|directory| directory.clone())
+        .unwrap_or(None)
+        .ok_or_else(|| "Choose an output folder first.".to_string())?;
     let mode =
         split::SplitMode::parse(&mode).ok_or_else(|| "Choose a valid split mode.".to_string())?;
 
-    let guard_app = app.clone();
     let task_directory = output_directory.clone();
-    let joined = tauri::async_runtime::spawn_blocking(move || {
-        let _guard = ConversionBusyGuard { app: guard_app };
-        split::split_pdf(&path, &task_directory, mode, &ranges)
-    })
-    .await;
-
-    let outcome = match joined {
-        Ok(result) => result.map_err(|error| error.to_string())?,
-        Err(error) => {
-            app.state::<InputState>()
-                .conversion_in_progress
-                .store(false, Ordering::SeqCst);
-            return Err(error.to_string());
-        }
-    };
+    let outcome = run_operation(
+        &app,
+        "pdf.split",
+        "Split",
+        OperationTarget::Directory(output_directory.clone()),
+        move |progress| split::split_pdf_with_progress(&path, &task_directory, mode, &ranges, progress),
+    )
+    .await?;
 
     let Some(first_file) = outcome.files.first() else {
         return Err("No output files were created.".to_string());
     };
-    let first_output = output_directory.join(&first_file.name);
     if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
-        *last_output = Some(first_output);
-    }
-    if let Ok(mut last_output_directory) = app.state::<InputState>().last_output_directory.lock() {
-        *last_output_directory = Some(output_directory.clone());
+        *last_output = Some(output_directory.join(&first_file.name));
     }
 
     let files = outcome
@@ -1388,190 +870,44 @@ async fn inspect_compress_source(app: AppHandle) -> Result<CompressSourceInfo, S
 
 #[tauri::command]
 async fn compress_pdf(app: AppHandle, preset: String) -> Result<ConversionResult, String> {
-    let (path, output_path, preset) = {
-        let state = app.state::<InputState>();
-        ensure_not_converting(&state)?;
+    let path = compress_input_path(&app)?;
+    let output = selected_output(&app.state::<InputState>())?;
+    let preset = compress::CompressionPreset::parse(&preset)
+        .ok_or_else(|| "Choose a valid compression preset.".to_string())?;
 
-        let action_id = state
-            .action_id
-            .lock()
-            .map(|action_id| action_id.clone())
-            .unwrap_or(None)
-            .ok_or_else(|| "Choose an action first.".to_string())?;
-
-        if action_id != "pdf.compress" {
-            return Err("This action is not available yet.".to_string());
-        }
-
-        let files = state
-            .files
-            .lock()
-            .map(|files| files.clone())
-            .unwrap_or_default();
-
-        if files.len() != 1 {
-            return Err("Select exactly one PDF to compress.".to_string());
-        }
-
-        let output_path = state
-            .output_path
-            .lock()
-            .map(|output| output.clone())
-            .unwrap_or(None)
-            .ok_or_else(|| "Choose an output destination first.".to_string())?;
-
-        let preset = compress::CompressionPreset::parse(&preset)
-            .ok_or_else(|| "Choose a valid compression preset.".to_string())?;
-
-        if state
-            .conversion_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err("A conversion is already running.".to_string());
-        }
-
-        (files[0].path.clone(), output_path, preset)
-    };
-
-    let progress_state = app.state::<OperationProgressState>();
-    let operation = progress_state.begin("pdf.compress", "Preparing PDF compression");
-    let cancellation_state = app.state::<OperationCancellationState>();
-    let cancel_token = cancellation_state.begin(&operation.operation_id);
-    emit_operation_progress(&app, &operation);
-
-    let progress_app = app.clone();
-    let progress_op_id = operation.operation_id.clone();
-    let progress_op_id_for_task = progress_op_id.clone();
-    let guard_app = app.clone();
-    let task_output = output_path.clone();
-    let eta_estimator = Arc::new(Mutex::new(CompressionEtaEstimator::new()));
-    let started_at = Instant::now();
-    let eta_estimator_clone = Arc::clone(&eta_estimator);
-    let joined = tauri::async_runtime::spawn_blocking(move || {
-        let _guard = ConversionBusyGuard { app: guard_app };
-        let cancel_flag = cancel_token;
-        compress::compress_pdf_with_overwrite_and_progress_cancelable(
-            &path,
-            &task_output,
-            preset,
-            &cancel_flag,
-            |stage, completed, total| {
-                let elapsed = started_at.elapsed().as_secs_f64();
-                let eta_seconds = {
-                    let mut estimator = eta_estimator_clone.lock().unwrap();
-                    estimator.record(stage, completed, total, elapsed)
-                };
-                let message = match stage {
-                    "streams" => format!("Compressing streams {completed}/{total}"),
-                    "images" => format!("Inspecting images {completed}/{total}"),
-                    "saving" => "Saving and validating PDF…".to_string(),
-                    _ => "Compressing PDF…".to_string(),
-                };
-                let snapshot = compression_progress_snapshot(CompressionProgressSnapshotInput {
-                    operation_id: &progress_op_id_for_task,
-                    status: "running",
-                    stage,
-                    message: message.to_string(),
-                    completed,
-                    total,
-                    unit: match stage {
-                        "streams" => Some("objects"),
-                        "images" => Some("images"),
-                        _ => None,
-                    },
-                    eta_seconds,
-                    error: None,
-                    output: None,
-                });
-                emit_operation_progress(&progress_app, &snapshot);
-            },
-        )
-    })
-    .await;
-
-    let outcome = match joined {
-        Ok(result) => match result {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                cancellation_state.clear(&progress_op_id);
-                if matches!(error, compress::CompressError::Cancelled { .. }) {
-                    let snapshot = OperationProgressSnapshot::new(
-                        progress_op_id.clone(),
-                        "cancelled",
-                        "cancelled",
-                        "Compression cancelled",
-                        false,
-                        0,
-                        0,
-                        None,
-                        None,
-                        Some(error.to_string()),
-                        None,
-                    );
-                    emit_operation_progress(&app, &snapshot);
-                    return Err("Compression cancelled".to_string());
-                }
-                app.state::<InputState>()
-                    .conversion_in_progress
-                    .store(false, Ordering::SeqCst);
-                return Err(error.to_string());
-            }
+    let task_output = output.clone();
+    let outcome = run_operation(
+        &app,
+        "pdf.compress",
+        "Compression",
+        OperationTarget::File(output.clone()),
+        move |reporter| {
+            let cancel = reporter.cancel_token();
+            compress::compress_pdf_with_overwrite_and_progress_cancelable(
+                &path,
+                &task_output,
+                preset,
+                &cancel,
+                |stage, completed, total| {
+                    // The final stages report a single step each, so a bar
+                    // would jump straight to 100%.
+                    if matches!(stage, "saving" | "validating" | "finalizing") {
+                        reporter.report(stage, 0, 0);
+                    } else {
+                        reporter.report(stage, completed, total);
+                    }
+                },
+            )
         },
-        Err(error) => {
-            cancellation_state.clear(&progress_op_id);
-            app.state::<InputState>()
-                .conversion_in_progress
-                .store(false, Ordering::SeqCst);
-            return Err(error.to_string());
-        }
-    };
-    cancellation_state.clear(&progress_op_id);
+    )
+    .await?;
 
-    if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
-        *last_output = Some(output_path.clone());
-    }
-    if let Ok(mut last_output_directory) = app.state::<InputState>().last_output_directory.lock() {
-        *last_output_directory = None;
-    }
-
-    let name = output_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "output.pdf".to_string());
-    let directory = output_path
-        .parent()
-        .map(|directory| directory.display().to_string())
-        .unwrap_or_default();
     let status = match outcome.status {
         compress::CompressionStatus::Reduced => "reduced",
         compress::CompressionStatus::NoReduction => "no-reduction",
     };
-    let snapshot = OperationProgressSnapshot::new(
-        progress_op_id,
-        "succeeded",
-        "complete",
-        format!("PDF compressed successfully ({})", name),
-        true,
-        1,
-        1,
-        Some("items"),
-        None,
-        None,
-        Some(OperationProgressOutput {
-            name: Some(name.clone()),
-            directory: Some(directory.clone()),
-            path: Some(output_path.display().to_string()),
-        }),
-    );
-    emit_operation_progress(&app, &snapshot);
 
     Ok(ConversionResult {
-        pages: outcome.pages,
-        bytes_written: outcome.output_bytes,
-        name,
-        directory,
-        files: None,
         compression: Some(ConversionCompression {
             original_bytes: outcome.original_bytes,
             output_bytes: outcome.output_bytes,
@@ -1582,6 +918,7 @@ async fn compress_pdf(app: AppHandle, preset: String) -> Result<ConversionResult
             images_recompressed: outcome.images_recompressed,
             images_skipped: outcome.images_skipped,
         }),
+        ..file_result(&output, outcome.pages, outcome.output_bytes)
     })
 }
 
@@ -1640,106 +977,42 @@ async fn run_page_selection(
 ) -> Result<ConversionResult, String> {
     let (action_id, path) = page_selection_input_path(&app)?;
     if organize::PageSelectionMode::from_action_id(&action_id) != Some(mode) {
-        return Err("This action is not available yet.".to_string());
+        return Err(UNAVAILABLE_ACTION.to_string());
     }
-
-    let output_path = {
-        let state = app.state::<InputState>();
-        let output_path = state
-            .output_path
-            .lock()
-            .map(|output| output.clone())
-            .unwrap_or(None)
-            .ok_or_else(|| "Choose an output destination first.".to_string())?;
-
-        if state
-            .conversion_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err("A conversion is already running.".to_string());
-        }
-
-        output_path
+    let output = selected_output(&app.state::<InputState>())?;
+    let (kind, title) = match mode {
+        organize::PageSelectionMode::Extract => ("pdf.extract_pages", "Page extraction"),
+        organize::PageSelectionMode::Delete => ("pdf.delete_pages", "Page deletion"),
     };
 
-    let guard_app = app.clone();
-    let task_output = output_path.clone();
-    let joined = tauri::async_runtime::spawn_blocking(move || {
-        let _guard = ConversionBusyGuard { app: guard_app };
-        match mode {
-            organize::PageSelectionMode::Extract => {
-                organize::extract(&path, &task_output, &selection, true)
-            }
-            organize::PageSelectionMode::Delete => {
-                organize::delete(&path, &task_output, &selection, true)
-            }
-        }
-    })
-    .await;
+    let task_output = output.clone();
+    let outcome = run_operation(
+        &app,
+        kind,
+        title,
+        OperationTarget::File(output.clone()),
+        move |progress| {
+            organize::write_selection(&path, &task_output, &selection, mode, true, progress)
+        },
+    )
+    .await?;
 
-    let outcome = match joined {
-        Ok(result) => result.map_err(|error| error.to_string())?,
-        Err(error) => {
-            app.state::<InputState>()
-                .conversion_in_progress
-                .store(false, Ordering::SeqCst);
-            return Err(error.to_string());
-        }
-    };
-
-    if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
-        *last_output = Some(output_path.clone());
-    }
-    if let Ok(mut last_output_directory) = app.state::<InputState>().last_output_directory.lock() {
-        *last_output_directory = None;
-    }
-
-    let name = output_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "output.pdf".to_string());
-    let directory = output_path
-        .parent()
-        .map(|directory| directory.display().to_string())
-        .unwrap_or_default();
-
-    Ok(ConversionResult {
-        pages: outcome.pages,
-        bytes_written: outcome.bytes_written,
-        name,
-        directory,
-        files: None,
-        compression: None,
-    })
+    Ok(file_result(&output, outcome.pages, outcome.bytes_written))
 }
 
 fn page_selection_input_path(app: &AppHandle) -> Result<(String, PathBuf), String> {
     let state = app.state::<InputState>();
     ensure_not_converting(&state)?;
 
-    let action_id = state
-        .action_id
-        .lock()
-        .map(|action_id| action_id.clone())
-        .unwrap_or(None)
-        .ok_or_else(|| "Choose an action first.".to_string())?;
-
+    let action_id = selected_action(&state)?;
     if organize::PageSelectionMode::from_action_id(&action_id).is_none() {
-        return Err("This action is not available yet.".to_string());
+        return Err(UNAVAILABLE_ACTION.to_string());
     }
 
-    let files = state
-        .files
-        .lock()
-        .map(|files| files.clone())
-        .unwrap_or_default();
-
-    if files.len() != 1 {
-        return Err("Select exactly one PDF.".to_string());
+    match selected_files(&state).as_slice() {
+        [file] => Ok((action_id, file.path.clone())),
+        _ => Err("Select exactly one PDF.".to_string()),
     }
-
-    Ok((action_id, files[0].path.clone()))
 }
 
 #[tauri::command]
@@ -1772,7 +1045,7 @@ async fn render_pdf_thumbnails(
 
 #[tauri::command]
 async fn inspect_rotate_source(app: AppHandle) -> Result<RotateSourceInfo, String> {
-    let (_, path) = rotate_input_path(&app)?;
+    let path = single_input_path(&app, "pdf.rotate_pages", "Select exactly one PDF.")?;
     let task_path = path.clone();
 
     let source = tauri::async_runtime::spawn_blocking(move || rotate::inspect_pdf(&task_path))
@@ -1801,119 +1074,22 @@ async fn rotate_pages(
     app: AppHandle,
     rotations: Vec<rotate::PageRotation>,
 ) -> Result<ConversionResult, String> {
-    let (path, output_path) = {
-        let state = app.state::<InputState>();
-        ensure_not_converting(&state)?;
+    let path = single_input_path(&app, "pdf.rotate_pages", "Select exactly one PDF to rotate.")?;
+    let output = selected_output(&app.state::<InputState>())?;
 
-        let action_id = state
-            .action_id
-            .lock()
-            .map(|action_id| action_id.clone())
-            .unwrap_or(None)
-            .ok_or_else(|| "Choose an action first.".to_string())?;
+    let task_output = output.clone();
+    let outcome = run_operation(
+        &app,
+        "pdf.rotate_pages",
+        "Rotation",
+        OperationTarget::File(output.clone()),
+        move |progress| {
+            rotate::rotate_pdf_with_overwrite_and_progress(&path, &task_output, &rotations, progress)
+        },
+    )
+    .await?;
 
-        if action_id != "pdf.rotate_pages" {
-            return Err("This action is not available yet.".to_string());
-        }
-
-        let files = state
-            .files
-            .lock()
-            .map(|files| files.clone())
-            .unwrap_or_default();
-
-        if files.len() != 1 {
-            return Err("Select exactly one PDF to rotate.".to_string());
-        }
-
-        let output_path = state
-            .output_path
-            .lock()
-            .map(|output| output.clone())
-            .unwrap_or(None)
-            .ok_or_else(|| "Choose an output destination first.".to_string())?;
-
-        if state
-            .conversion_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err("A conversion is already running.".to_string());
-        }
-
-        (files[0].path.clone(), output_path)
-    };
-
-    let guard_app = app.clone();
-    let task_output = output_path.clone();
-    let joined = tauri::async_runtime::spawn_blocking(move || {
-        let _guard = ConversionBusyGuard { app: guard_app };
-        rotate::rotate_pdf_with_overwrite(&path, &task_output, &rotations)
-    })
-    .await;
-
-    let outcome = match joined {
-        Ok(result) => result.map_err(|error| error.to_string())?,
-        Err(error) => {
-            app.state::<InputState>()
-                .conversion_in_progress
-                .store(false, Ordering::SeqCst);
-            return Err(error.to_string());
-        }
-    };
-
-    if let Ok(mut last_output) = app.state::<InputState>().last_output.lock() {
-        *last_output = Some(output_path.clone());
-    }
-    if let Ok(mut last_output_directory) = app.state::<InputState>().last_output_directory.lock() {
-        *last_output_directory = None;
-    }
-
-    let name = output_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "output.pdf".to_string());
-    let directory = output_path
-        .parent()
-        .map(|directory| directory.display().to_string())
-        .unwrap_or_default();
-
-    Ok(ConversionResult {
-        pages: outcome.pages,
-        bytes_written: outcome.bytes_written,
-        name,
-        directory,
-        files: None,
-        compression: None,
-    })
-}
-
-fn rotate_input_path(app: &AppHandle) -> Result<(String, PathBuf), String> {
-    let state = app.state::<InputState>();
-    ensure_not_converting(&state)?;
-
-    let action_id = state
-        .action_id
-        .lock()
-        .map(|action_id| action_id.clone())
-        .unwrap_or(None)
-        .ok_or_else(|| "Choose an action first.".to_string())?;
-
-    if action_id != "pdf.rotate_pages" {
-        return Err("This action is not available yet.".to_string());
-    }
-
-    let files = state
-        .files
-        .lock()
-        .map(|files| files.clone())
-        .unwrap_or_default();
-
-    if files.len() != 1 {
-        return Err("Select exactly one PDF.".to_string());
-    }
-
-    Ok((action_id, files[0].path.clone()))
+    Ok(file_result(&output, outcome.pages, outcome.bytes_written))
 }
 
 fn last_output_path(state: &InputState) -> Result<PathBuf, String> {
@@ -2049,18 +1225,7 @@ fn ingest_paths(
         if let Ok(mut stored_action) = state.action_id.lock() {
             *stored_action = Some(action_id.to_string());
         }
-        if let Ok(mut output_path) = state.output_path.lock() {
-            *output_path = None;
-        }
-        if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
-            *split_output_dir = None;
-        }
-        if let Ok(mut last_output) = state.last_output.lock() {
-            *last_output = None;
-        }
-        if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
-            *last_output_directory = None;
-        }
+        clear_outputs(state);
     }
 
     let mut selection = input_snapshot(state);
@@ -2153,18 +1318,7 @@ fn remove_input_file(app: AppHandle, id: u64) -> Result<InputSelection, String> 
     if let Ok(mut files) = state.files.lock() {
         files.retain(|file| file.id != id);
     }
-    if let Ok(mut output_path) = state.output_path.lock() {
-        *output_path = None;
-    }
-    if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
-        *split_output_dir = None;
-    }
-    if let Ok(mut last_output) = state.last_output.lock() {
-        *last_output = None;
-    }
-    if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
-        *last_output_directory = None;
-    }
+    clear_outputs(&state);
 
     Ok(input_snapshot(&state))
 }
@@ -2177,18 +1331,7 @@ fn clear_input(app: AppHandle) -> Result<(), String> {
     if let Ok(mut files) = state.files.lock() {
         files.clear();
     }
-    if let Ok(mut output_path) = state.output_path.lock() {
-        *output_path = None;
-    }
-    if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
-        *split_output_dir = None;
-    }
-    if let Ok(mut last_output) = state.last_output.lock() {
-        *last_output = None;
-    }
-    if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
-        *last_output_directory = None;
-    }
+    clear_outputs(&state);
 
     Ok(())
 }
@@ -2228,74 +1371,15 @@ fn clear_input_state(state: &InputState) {
     if let Ok(mut action_id) = state.action_id.lock() {
         *action_id = None;
     }
-    if let Ok(mut output_path) = state.output_path.lock() {
-        *output_path = None;
-    }
-    if let Ok(mut split_output_dir) = state.split_output_dir.lock() {
-        *split_output_dir = None;
-    }
-    if let Ok(mut last_output) = state.last_output.lock() {
-        *last_output = None;
-    }
-    if let Ok(mut last_output_directory) = state.last_output_directory.lock() {
-        *last_output_directory = None;
-    }
+    clear_outputs(state);
 }
 
 fn split_input_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let state = app.state::<InputState>();
-    ensure_not_converting(&state)?;
-
-    let action_id = state
-        .action_id
-        .lock()
-        .map(|action_id| action_id.clone())
-        .unwrap_or(None)
-        .ok_or_else(|| "Choose an action first.".to_string())?;
-
-    if action_id != "pdf.split" {
-        return Err("This action is not available yet.".to_string());
-    }
-
-    let files = state
-        .files
-        .lock()
-        .map(|files| files.clone())
-        .unwrap_or_default();
-
-    if files.len() != 1 {
-        return Err("Select exactly one PDF to split.".to_string());
-    }
-
-    Ok(files[0].path.clone())
+    single_input_path(app, "pdf.split", "Select exactly one PDF to split.")
 }
 
 fn compress_input_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let state = app.state::<InputState>();
-    ensure_not_converting(&state)?;
-
-    let action_id = state
-        .action_id
-        .lock()
-        .map(|action_id| action_id.clone())
-        .unwrap_or(None)
-        .ok_or_else(|| "Choose an action first.".to_string())?;
-
-    if action_id != "pdf.compress" {
-        return Err("This action is not available yet.".to_string());
-    }
-
-    let files = state
-        .files
-        .lock()
-        .map(|files| files.clone())
-        .unwrap_or_default();
-
-    if files.len() != 1 {
-        return Err("Select exactly one PDF to compress.".to_string());
-    }
-
-    Ok(files[0].path.clone())
+    single_input_path(app, "pdf.compress", "Select exactly one PDF to compress.")
 }
 
 fn max_files_for_action(action_id: &str) -> usize {
@@ -2833,8 +1917,8 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .manage(MenuState::default())
         .manage(InputState::default())
-        .manage(OperationProgressState::default())
-        .manage(OperationCancellationState::default())
+        .manage(operation::OperationProgressState::default())
+        .manage(operation::OperationCancellationState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(
@@ -2857,8 +1941,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_menu,
             keep_menu_alive,
-            get_operation_progress,
-            cancel_operation,
+            operation::get_operation_progress,
+            operation::cancel_operation,
             dismiss_menu,
             get_menu_status,
             pick_input_files,
@@ -3225,157 +2309,4 @@ mod tests {
 
         std::fs::remove_dir_all(dir).expect("test directory should be removed");
     }
-
-    #[test]
-    fn operation_progress_rejects_invalid_determinate_ranges() {
-        let invalid = super::OperationProgressSnapshot::new(
-            "images.convert_to_pdf",
-            "running",
-            "Preparing",
-            "Preparing PDF conversion",
-            true,
-            3,
-            2,
-            Some("pages"),
-            None,
-            None,
-            None,
-        );
-        assert!(!invalid.is_valid_determinate_progress());
-
-        let valid = super::OperationProgressSnapshot::new(
-            "images.convert_to_pdf",
-            "running",
-            "Writing",
-            "Writing PDF pages",
-            true,
-            3,
-            5,
-            Some("pages"),
-            None,
-            None,
-            None,
-        );
-        assert!(valid.is_valid_determinate_progress());
-    }
-
-    #[test]
-    fn operation_progress_state_tracks_unique_operation_ids() {
-        let state = super::OperationProgressState::default();
-        let first = state.begin("images.convert_to_pdf", "Preparing conversion");
-        let second = state.begin("images.convert_to_pdf", "Writing PDF");
-
-        assert_ne!(first.operation_id, second.operation_id);
-        assert_eq!(state.current_operation_id().as_deref(), Some(second.operation_id.as_str()));
-        assert_eq!(state.snapshot().as_ref().map(|snapshot| snapshot.operation_id.as_str()), Some(second.operation_id.as_str()));
-    }
-
-    #[test]
-    fn operation_progress_ignores_stale_events_and_non_monotonic_updates() {
-        let state = super::OperationProgressState::default();
-        let first = state.begin("images.convert_to_pdf", "Preparing conversion");
-        let second = state.begin("images.convert_to_pdf", "Writing PDF");
-
-        let stale = super::OperationProgressSnapshot::new(
-            first.operation_id.clone(),
-            "running",
-            "reading",
-            "Reading images 1/4",
-            true,
-            1,
-            4,
-            Some("images"),
-            None,
-            None,
-            None,
-        );
-        assert!(!state.accepts_snapshot(&stale));
-
-        let late = super::OperationProgressSnapshot::new(
-            second.operation_id.clone(),
-            "running",
-            "reading",
-            "Reading images 2/4",
-            true,
-            2,
-            4,
-            Some("images"),
-            None,
-            None,
-            None,
-        );
-        assert!(state.accepts_snapshot(&late));
-        state.update(late.clone());
-
-        let regressed = super::OperationProgressSnapshot::new(
-            second.operation_id.clone(),
-            "running",
-            "reading",
-            "Reading images 1/4",
-            true,
-            1,
-            4,
-            Some("images"),
-            None,
-            None,
-            None,
-        );
-        assert!(!state.accepts_snapshot(&regressed));
-    }
-
-    #[test]
-    fn compression_eta_starts_unavailable_and_becomes_available_with_observations() {
-        let mut estimator = super::CompressionEtaEstimator::new();
-
-        assert_eq!(estimator.record("streams", 1, 10, 0.25), None);
-        assert_eq!(estimator.record("streams", 5, 10, 1.5), Some(1));
-        assert_eq!(estimator.record("streams", 7, 10, 2.5), Some(1));
-    }
-
-    #[test]
-    fn compression_eta_resets_when_stage_changes() {
-        let mut estimator = super::CompressionEtaEstimator::new();
-
-        assert_eq!(estimator.record("streams", 6, 10, 3.0), None);
-        assert_eq!(estimator.record("saving", 1, 1, 0.25), None);
-        assert_eq!(estimator.record("streams", 8, 10, 3.5), None);
-        assert_eq!(estimator.record("streams", 9, 10, 4.0), Some(0));
-    }
-
-    #[test]
-    fn compression_finalization_stages_are_indeterminate() {
-        let snapshot = super::compression_progress_snapshot(super::CompressionProgressSnapshotInput {
-            operation_id: "pdf.compress:1",
-            status: "running",
-            stage: "saving",
-            message: "Saving compressed PDF…".to_string(),
-            completed: 1,
-            total: 1,
-            unit: Some("items"),
-            eta_seconds: Some(12),
-            error: None,
-            output: None,
-        });
-
-        assert!(!snapshot.determinate);
-        assert_eq!(snapshot.completed, None);
-        assert_eq!(snapshot.total, None);
-        assert_eq!(snapshot.eta_seconds, None);
-        assert_eq!(snapshot.stage, "saving");
-    }
-
-    #[test]
-    fn operation_cancellation_tracks_active_operation_tokens() {
-        let state = super::OperationCancellationState::default();
-        let token = state.begin("pdf.compress:9");
-
-        assert!(!token.load(Ordering::SeqCst));
-        assert!(state.request_cancel("pdf.compress:9"));
-        assert!(state.is_cancelled("pdf.compress:9"));
-        assert!(token.load(Ordering::SeqCst));
-
-        state.clear("pdf.compress:9");
-        assert!(!state.is_cancelled("pdf.compress:9"));
-    }
-
 }
