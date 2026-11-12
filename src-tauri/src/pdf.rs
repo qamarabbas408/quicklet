@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref};
 use tempfile::NamedTempFile;
 
+use crate::progress::{self, Progress};
+
 pub const MAX_IMAGES: usize = 8;
 pub const A4_WIDTH_PT: f32 = 595.0;
 pub const A4_HEIGHT_PT: f32 = 842.0;
@@ -24,6 +26,7 @@ pub enum PdfError {
     OutputExists { path: PathBuf },
     OutputDirectoryInvalid { path: PathBuf },
     OutputWrite { path: PathBuf, source: io::Error },
+    Cancelled,
 }
 
 impl fmt::Display for PdfError {
@@ -83,7 +86,20 @@ impl fmt::Display for PdfError {
             Self::OutputWrite { path, source } => {
                 write!(formatter, "Could not write {}: {source}", path.display())
             }
+            Self::Cancelled => write!(formatter, "Conversion cancelled."),
         }
+    }
+}
+
+impl From<progress::Cancelled> for PdfError {
+    fn from(_: progress::Cancelled) -> Self {
+        Self::Cancelled
+    }
+}
+
+impl progress::OperationError for PdfError {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
     }
 }
 
@@ -134,7 +150,7 @@ struct PageImage {
 ///
 /// Input paths are read in order. Existing output files are never overwritten.
 pub fn convert_images_to_pdf(inputs: &[PathBuf], output: &Path) -> Result<PdfOutcome, PdfError> {
-    convert_with_progress(inputs, output, false, |_, _, _| {})
+    convert_images_to_pdf_with_progress(inputs, output, false, &mut ())
 }
 
 /// Like [`convert_images_to_pdf`], but replaces an existing output file.
@@ -145,32 +161,17 @@ pub fn convert_images_to_pdf_with_overwrite(
     inputs: &[PathBuf],
     output: &Path,
 ) -> Result<PdfOutcome, PdfError> {
-    convert_with_progress(inputs, output, true, |_, _, _| {})
+    convert_images_to_pdf_with_progress(inputs, output, true, &mut ())
 }
 
-pub fn convert_images_to_pdf_with_progress<F>(
+/// Reports `reading` per image and `building`, and stops before writing if
+/// `progress` cancels.
+pub fn convert_images_to_pdf_with_progress(
     inputs: &[PathBuf],
     output: &Path,
     allow_overwrite: bool,
-    mut on_progress: F,
-) -> Result<PdfOutcome, PdfError>
-where
-    F: FnMut(usize, usize, &str),
-{
-    convert_with_progress(inputs, output, allow_overwrite, |completed, total, stage| {
-        on_progress(completed, total, stage);
-    })
-}
-
-fn convert_with_progress<F>(
-    inputs: &[PathBuf],
-    output: &Path,
-    allow_overwrite: bool,
-    mut on_progress: F,
-) -> Result<PdfOutcome, PdfError>
-where
-    F: FnMut(usize, usize, &str),
-{
+    progress: &mut dyn Progress,
+) -> Result<PdfOutcome, PdfError> {
     if inputs.is_empty() {
         return Err(PdfError::NoInputs);
     }
@@ -181,19 +182,17 @@ where
     validate_output(output, allow_overwrite)?;
 
     let total = inputs.len();
-    on_progress(0, total, "reading");
+    progress.step("reading", 0, total)?;
 
     let mut pages = Vec::with_capacity(total);
     for (index, path) in inputs.iter().enumerate() {
-        let page = read_page(path)?;
-        pages.push(page);
-        on_progress(index + 1, total, "reading");
+        pages.push(read_page(path)?);
+        progress.step("reading", index + 1, total)?;
     }
 
-    on_progress(total, total, "building");
+    progress.step("building", 0, 0)?;
     let bytes = build_pdf(&pages);
 
-    on_progress(total, total, "writing");
     write_safely(output, &bytes, allow_overwrite)?;
 
     Ok(PdfOutcome {
@@ -1095,5 +1094,30 @@ mod tests {
             convert_images_to_pdf(&inputs, &dir.path().join("many.pdf")),
             Err(PdfError::TooManyInputs { max: MAX_IMAGES })
         ));
+    }
+
+    #[test]
+    fn reports_each_image_and_writes_nothing_when_cancelled() {
+        use crate::progress::testing::Recorder;
+
+        let dir = tempdir().unwrap();
+        let inputs = vec![dir.path().join("a.png"), dir.path().join("b.png")];
+        for input in &inputs {
+            write_png(input, 40, 30, false);
+        }
+
+        let output = dir.path().join("out.pdf");
+        let mut recorder = Recorder::default();
+        convert_images_to_pdf_with_progress(&inputs, &output, false, &mut recorder).unwrap();
+        assert_eq!(
+            recorder.steps,
+            vec![("reading", 0, 2), ("reading", 1, 2), ("reading", 2, 2), ("building", 0, 0)]
+        );
+
+        let cancelled = dir.path().join("cancelled.pdf");
+        let result =
+            convert_images_to_pdf_with_progress(&inputs, &cancelled, false, &mut Recorder::cancelling_at(2));
+        assert!(matches!(result, Err(PdfError::Cancelled)));
+        assert!(!cancelled.exists());
     }
 }

@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use tempfile::NamedTempFile;
 
+use crate::progress::{self, Progress};
+
 /// Rotation uses the same input-size ceiling as the other PDF actions.
 pub const MAX_ROTATE_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 /// Rotation uses the same page ceiling as Split, Extract, and Delete.
@@ -80,6 +82,7 @@ pub enum RotateError {
     OutputCollision { path: PathBuf },
     OutputWrite { path: PathBuf, source: io::Error },
     OutputValidation { path: PathBuf, reason: String },
+    Cancelled,
 }
 
 impl fmt::Display for RotateError {
@@ -163,7 +166,20 @@ impl fmt::Display for RotateError {
                 "The generated PDF could not be validated: {}: {reason}",
                 path.display()
             ),
+            Self::Cancelled => write!(formatter, "Rotation cancelled."),
         }
+    }
+}
+
+impl From<progress::Cancelled> for RotateError {
+    fn from(_: progress::Cancelled) -> Self {
+        Self::Cancelled
+    }
+}
+
+impl progress::OperationError for RotateError {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
     }
 }
 
@@ -199,7 +215,7 @@ pub fn rotate_pdf(
     output: &Path,
     rotations: &[PageRotation],
 ) -> Result<RotateOutcome, RotateError> {
-    rotate(input, output, rotations, false)
+    rotate(input, output, rotations, false, &mut ())
 }
 
 /// Like [`rotate_pdf`], but atomically replaces an existing output.
@@ -211,7 +227,18 @@ pub fn rotate_pdf_with_overwrite(
     output: &Path,
     rotations: &[PageRotation],
 ) -> Result<RotateOutcome, RotateError> {
-    rotate(input, output, rotations, true)
+    rotate(input, output, rotations, true, &mut ())
+}
+
+/// Like [`rotate_pdf_with_overwrite`], reporting `loading` and `saving`, and
+/// stopping before writing if `progress` cancels.
+pub fn rotate_pdf_with_overwrite_and_progress(
+    input: &Path,
+    output: &Path,
+    rotations: &[PageRotation],
+    progress: &mut dyn Progress,
+) -> Result<RotateOutcome, RotateError> {
+    rotate(input, output, rotations, true, progress)
 }
 
 fn rotate(
@@ -219,11 +246,13 @@ fn rotate(
     output: &Path,
     rotations: &[PageRotation],
     allow_overwrite: bool,
+    progress: &mut dyn Progress,
 ) -> Result<RotateOutcome, RotateError> {
     if rotations.is_empty() {
         return Err(RotateError::EmptySelection);
     }
 
+    progress.step("loading", 0, 0)?;
     let mut loaded = load_document(input)?;
     validate_output(input, output, allow_overwrite)?;
 
@@ -269,6 +298,7 @@ fn rotate(
         page.set("Rotate", Object::Integer(i64::from(new_rotation)));
     }
 
+    progress.step("saving", 0, 0)?;
     let mut bytes = Vec::new();
     loaded
         .document
@@ -1725,5 +1755,26 @@ mod tests {
             Err(RotateError::OutputDirectoryInvalid { .. })
         ));
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn writes_nothing_when_cancelled() {
+        use crate::progress::testing::Recorder;
+
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("source.pdf");
+        write_fixture(&input);
+        let output = dir.path().join("out.pdf");
+
+        // Steps: loading, saving (cancelled).
+        let result = rotate_pdf_with_overwrite_and_progress(
+            &input,
+            &output,
+            &[PageRotation { page: 1, turns: 1 }],
+            &mut Recorder::cancelling_at(1),
+        );
+
+        assert!(matches!(result, Err(RotateError::Cancelled)));
+        assert!(!output.exists());
     }
 }

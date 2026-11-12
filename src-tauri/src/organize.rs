@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
+use crate::progress::{self, Progress};
 use crate::split::{self, SplitError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -61,6 +62,7 @@ pub enum OrganizeError {
     InvalidSelection(String),
     NoPages,
     Processing(String),
+    Cancelled,
 }
 
 impl fmt::Display for OrganizeError {
@@ -72,7 +74,14 @@ impl fmt::Display for OrganizeError {
                 "That selection would remove every page. Keep at least one page."
             ),
             Self::Processing(message) => formatter.write_str(message),
+            Self::Cancelled => write!(formatter, "Page selection cancelled."),
         }
+    }
+}
+
+impl progress::OperationError for OrganizeError {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
     }
 }
 
@@ -84,6 +93,7 @@ impl From<SplitError> for OrganizeError {
             SplitError::InvalidRanges(_) | SplitError::TooManyRanges { .. } => {
                 Self::InvalidSelection(error.to_string())
             }
+            SplitError::Cancelled => Self::Cancelled,
             _ => Self::Processing(error.to_string()),
         }
     }
@@ -139,12 +149,13 @@ pub fn extract(
     selection: &str,
     allow_overwrite: bool,
 ) -> Result<PageSelectionOutcome, OrganizeError> {
-    write(
+    write_selection(
         input,
         output,
         selection,
         PageSelectionMode::Extract,
         allow_overwrite,
+        &mut (),
     )
 }
 
@@ -154,25 +165,35 @@ pub fn delete(
     selection: &str,
     allow_overwrite: bool,
 ) -> Result<PageSelectionOutcome, OrganizeError> {
-    write(
+    write_selection(
         input,
         output,
         selection,
         PageSelectionMode::Delete,
         allow_overwrite,
+        &mut (),
     )
 }
 
-fn write(
+/// Writes the pages `mode` keeps from `selection`, reporting through
+/// `progress` and stopping before writing if it cancels.
+pub fn write_selection(
     input: &std::path::Path,
     output: &std::path::Path,
     selection: &str,
     mode: PageSelectionMode,
     allow_overwrite: bool,
+    progress: &mut dyn Progress,
 ) -> Result<PageSelectionOutcome, OrganizeError> {
     let source = split::inspect_pdf(input)?;
     let plan = plan(source.pages, selection, mode)?;
-    let outcome = split::write_page_selection(input, output, &plan.output_pages, allow_overwrite)?;
+    let outcome = split::write_page_selection_with_progress(
+        input,
+        output,
+        &plan.output_pages,
+        allow_overwrite,
+        progress,
+    )?;
 
     Ok(PageSelectionOutcome {
         pages: outcome.pages,
@@ -547,6 +568,35 @@ mod tests {
         write_encrypted_pdf(&source, &encrypted);
         assert!(extract(&encrypted, &output, "1", true).is_err());
         assert!(delete(&encrypted, &output, "2", true).is_err());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn writes_nothing_when_cancelled() {
+        use crate::progress::testing::Recorder;
+
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("source.pdf");
+        write_test_pdf(
+            &input,
+            &[
+                TestPage::new(595.0, 842.0, 0, "One", None),
+                TestPage::new(595.0, 842.0, 0, "Two", None),
+            ],
+        );
+        let output = dir.path().join("out.pdf");
+
+        // Steps: loading, building (cancelled).
+        let result = write_selection(
+            &input,
+            &output,
+            "1",
+            PageSelectionMode::Extract,
+            false,
+            &mut Recorder::cancelling_at(1),
+        );
+
+        assert!(matches!(result, Err(OrganizeError::Cancelled)));
         assert!(!output.exists());
     }
 }

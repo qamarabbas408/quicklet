@@ -196,6 +196,12 @@ impl fmt::Display for CompressError {
     }
 }
 
+impl crate::progress::OperationError for CompressError {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled { .. })
+    }
+}
+
 impl std::error::Error for CompressError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
