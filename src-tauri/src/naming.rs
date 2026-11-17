@@ -48,6 +48,24 @@ pub fn image_output_name(
     )
 }
 
+/// `photo.png` compressed in place becomes
+/// `Quicklet-Compress-photo-YYYYMMDD-HHMMSS.png`.
+pub fn image_compression_output_name(
+    source: &std::path::Path,
+    extension: &str,
+    now: DateTime<Local>,
+) -> String {
+    let stem = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = sanitize_stem(&stem, "Image", false);
+    format!(
+        "Quicklet-Compress-{stem}-{}.{extension}",
+        format_timestamp(now)
+    )
+}
+
 pub fn split_output_name(stem: &str, start: usize, end: usize) -> String {
     let stem = sanitize_source_stem(stem);
     if start == end {
@@ -215,6 +233,29 @@ mod tests {
         assert_eq!(
             image_output_name(Path::new(""), "jpg", now),
             "Quicklet-Convert-Image-20261024-153045.jpg"
+        );
+    }
+
+    #[test]
+    fn image_compression_output_name_uses_action_source_and_timestamp() {
+        use std::path::Path;
+
+        let now = fixed_time();
+        assert_eq!(
+            image_compression_output_name(Path::new("/tmp/photo.png"), "png", now),
+            "Quicklet-Compress-photo-20261024-153045.png"
+        );
+        assert_eq!(
+            image_compression_output_name(Path::new("archive.tar.JPG"), "jpg", now),
+            "Quicklet-Compress-archive.tar-20261024-153045.jpg"
+        );
+        assert_eq!(
+            image_compression_output_name(Path::new("photo.jpeg"), "jpeg", now),
+            "Quicklet-Compress-photo-20261024-153045.jpeg"
+        );
+        assert_eq!(
+            image_compression_output_name(Path::new(""), "webp", now),
+            "Quicklet-Compress-Image-20261024-153045.webp"
         );
     }
 

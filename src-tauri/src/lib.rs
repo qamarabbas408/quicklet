@@ -1,4 +1,5 @@
 pub mod compress;
+pub mod image_compression;
 pub mod image_conversion;
 pub mod merge;
 pub mod naming;
@@ -109,6 +110,25 @@ struct ConversionResult {
     compression: Option<ConversionCompression>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<ConversionImage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_compression: Option<ImageCompressionReport>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageCompressionReport {
+    format: String,
+    format_label: String,
+    width: u32,
+    height: u32,
+    original_bytes: u64,
+    output_bytes: u64,
+    saved_bytes: u64,
+    reduction_percent: f64,
+    status: String,
+    had_alpha: bool,
+    jpeg_quality: Option<u8>,
+    metadata: image_compression::ImageMetadataSummary,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -130,6 +150,24 @@ struct ImageFormatOption {
     extension: String,
     lossy: bool,
     supports_alpha: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageCompressionSourceInfo {
+    name: String,
+    format: String,
+    format_label: String,
+    width: u32,
+    height: u32,
+    bytes: u64,
+    has_alpha: bool,
+    orientation: u8,
+    metadata: image_compression::ImageMetadataSummary,
+    default_jpeg_quality: u8,
+    max_input_bytes: u64,
+    max_dimension: u32,
+    max_pixels: u64,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -243,6 +281,7 @@ fn file_result(output: &Path, pages: usize, bytes_written: u64) -> ConversionRes
         files: None,
         compression: None,
         image: None,
+        image_compression: None,
     }
 }
 
@@ -613,7 +652,13 @@ async fn choose_output(
         return Err("Add files before choosing an output.".to_string());
     }
 
-    let (title, filter, extension, default_name) = if action_id == "images.convert_format" {
+    let (title, filter_label, filter_extensions, extension, default_name): (
+        &str,
+        &str,
+        Vec<&str>,
+        String,
+        String,
+    ) = if action_id == "images.convert_format" {
         let format = format
             .as_deref()
             .and_then(image_conversion::ImageFormat::parse)
@@ -621,9 +666,22 @@ async fn choose_output(
         let extension = format.extension();
         (
             "Save image",
-            (format.label(), vec![extension]),
-            extension,
+            format.label(),
+            vec![extension],
+            extension.to_string(),
             naming::image_output_name(&files[0].path, extension, Local::now()),
+        )
+    } else if action_id == "images.compress" {
+        let (label, extensions, extension) =
+            compression_output_spec(files[0].extension.as_deref()).ok_or_else(|| {
+                "Compression supports PNG, JPEG, and WebP images only.".to_string()
+            })?;
+        (
+            "Save compressed image",
+            label,
+            extensions,
+            extension.to_string(),
+            naming::image_compression_output_name(&files[0].path, extension, Local::now()),
         )
     } else {
         let compression_preset = if action_id == "pdf.compress" {
@@ -640,7 +698,7 @@ async fn choose_output(
         let default_name =
             naming::default_output_name(&action_id, compression_preset, Local::now())
                 .ok_or_else(|| "This action does not use a single output file.".to_string())?;
-        ("Save PDF", ("PDF", vec!["pdf"]), "pdf", default_name)
+        ("Save PDF", "PDF", vec!["pdf"], "pdf".to_string(), default_name)
     };
 
     state.dialog_open.store(true, Ordering::SeqCst);
@@ -650,7 +708,7 @@ async fn choose_output(
         .file()
         .set_title(title)
         .set_parent(&window)
-        .add_filter(filter.0, &filter.1)
+        .add_filter(filter_label, &filter_extensions)
         .set_file_name(default_name);
 
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -671,7 +729,7 @@ async fn choose_output(
 
     let path = ensure_output_path(
         file_path.into_path().map_err(|error| error.to_string())?,
-        extension,
+        &extension,
     )?;
     let (name, directory) = file_name_and_directory(&path);
 
@@ -874,6 +932,7 @@ async fn split_pdf(
         files: Some(files),
         compression: None,
         image: None,
+        image_compression: None,
     })
 }
 
@@ -1193,6 +1252,89 @@ async fn convert_image(
 }
 
 #[tauri::command]
+async fn inspect_image_compression_source(
+    app: AppHandle,
+) -> Result<ImageCompressionSourceInfo, String> {
+    let path = single_input_path(&app, "images.compress", "Select exactly one image.")?;
+    let task_path = path.clone();
+
+    let source =
+        tauri::async_runtime::spawn_blocking(move || image_compression::inspect_image(&task_path))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+
+    Ok(ImageCompressionSourceInfo {
+        name: file_name_and_directory(&path).0,
+        format: source.format.id().to_string(),
+        format_label: source.format.label().to_string(),
+        width: source.width,
+        height: source.height,
+        bytes: source.bytes,
+        has_alpha: source.has_alpha,
+        orientation: source.orientation,
+        metadata: source.metadata,
+        default_jpeg_quality: image_compression::DEFAULT_COMPRESSION_JPEG_QUALITY,
+        max_input_bytes: image_conversion::MAX_INPUT_BYTES,
+        max_dimension: image_conversion::MAX_DIMENSION,
+        max_pixels: image_conversion::MAX_PIXELS,
+    })
+}
+
+#[tauri::command]
+async fn compress_image(app: AppHandle, quality: Option<u8>) -> Result<ConversionResult, String> {
+    let path = single_input_path(&app, "images.compress", "Select exactly one image.")?;
+    let output = selected_output(&app.state::<InputState>())?;
+    let mut options = image_compression::CompressionOptions::new();
+    if let Some(quality) = quality {
+        options.jpeg_quality = quality;
+    }
+    let jpeg_quality = options.jpeg_quality;
+
+    let task_output = output.clone();
+    let outcome = run_operation(
+        &app,
+        "images.compress",
+        "Image compression",
+        OperationTarget::File(output.clone()),
+        move |progress| {
+            image_compression::compress_image_with_progress(
+                &path,
+                &task_output,
+                options,
+                true,
+                progress,
+            )
+        },
+    )
+    .await?;
+
+    let status = match outcome.status {
+        image_compression::CompressionStatus::Reduced => "reduced",
+        image_compression::CompressionStatus::NoReduction => "no-reduction",
+    };
+
+    Ok(ConversionResult {
+        image_compression: Some(ImageCompressionReport {
+            format: outcome.format.id().to_string(),
+            format_label: outcome.format.label().to_string(),
+            width: outcome.width,
+            height: outcome.height,
+            original_bytes: outcome.original_bytes,
+            output_bytes: outcome.output_bytes,
+            saved_bytes: outcome.saved_bytes,
+            reduction_percent: outcome.reduction_percent,
+            status: status.to_string(),
+            had_alpha: outcome.had_alpha,
+            jpeg_quality: (outcome.format == image_conversion::ImageFormat::Jpeg)
+                .then_some(jpeg_quality),
+            metadata: outcome.metadata,
+        }),
+        ..file_result(&output, 1, outcome.output_bytes)
+    })
+}
+
+#[tauri::command]
 async fn inspect_rotate_source(app: AppHandle) -> Result<RotateSourceInfo, String> {
     let path = single_input_path(&app, "pdf.rotate_pages", "Select exactly one PDF.")?;
     let task_path = path.clone();
@@ -1264,6 +1406,20 @@ fn open_output(app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(path.to_string_lossy().into_owned(), None::<&str>)
         .map_err(|error| error.to_string())
+}
+
+/// Maps a validated source extension to the compression save-dialog label,
+/// filter extensions, and canonical output extension.
+fn compression_output_spec(
+    source_extension: Option<&str>,
+) -> Option<(&'static str, Vec<&'static str>, &'static str)> {
+    match source_extension {
+        Some("jpg") => Some(("JPEG", vec!["jpg", "jpeg"], "jpg")),
+        Some("jpeg") => Some(("JPEG", vec!["jpg", "jpeg"], "jpeg")),
+        Some("png") => Some(("PNG", vec!["png"], "png")),
+        Some("webp") => Some(("WebP", vec!["webp"], "webp")),
+        _ => None,
+    }
 }
 
 /// Normalises the save-dialog path and prevents a corrected extension from
@@ -1556,6 +1712,7 @@ fn max_files_for_action(action_id: &str) -> usize {
     if matches!(
         action_id,
         "images.convert_format"
+            | "images.compress"
             | "pdf.split"
             | "pdf.compress"
             | "pdf.extract_pages"
@@ -1571,7 +1728,7 @@ fn max_files_for_action(action_id: &str) -> usize {
 fn action_input_kind(action_id: &str) -> Option<&'static str> {
     match action_id {
         "images.convert_to_pdf" => Some("images"),
-        "images.convert_format" => Some("image"),
+        "images.convert_format" | "images.compress" => Some("image"),
         "pdf.merge" | "pdf.split" | "pdf.compress" | "pdf.extract_pages" | "pdf.delete_pages"
         | "pdf.rotate_pages" => Some("pdf"),
         _ => None,
@@ -1628,11 +1785,18 @@ fn category_actions(category_id: &str) -> Vec<ActionInfo> {
                 Some("image"),
             ),
             action(
+                "images.compress",
+                "Compress Image",
+                "Reduce file size without changing format or dimensions",
+                true,
+                Some("image"),
+            ),
+            action(
                 "images.resize_compress",
-                "Resize or compress",
-                "Change dimensions or file size",
+                "Resize Image",
+                "Change image dimensions",
                 false,
-                Some("images"),
+                Some("image"),
             ),
         ],
         "pdf" => vec![
@@ -2141,6 +2305,8 @@ pub fn run() {
             delete_pages,
             inspect_image_source,
             convert_image,
+            inspect_image_compression_source,
+            compress_image,
             inspect_rotate_source,
             rotate_pages,
             render_pdf_thumbnails,
@@ -2359,6 +2525,28 @@ mod tests {
     }
 
     #[test]
+    fn compression_output_spec_preserves_format_and_extension() {
+        assert_eq!(
+            super::compression_output_spec(Some("jpg")),
+            Some(("JPEG", vec!["jpg", "jpeg"], "jpg"))
+        );
+        assert_eq!(
+            super::compression_output_spec(Some("jpeg")),
+            Some(("JPEG", vec!["jpg", "jpeg"], "jpeg"))
+        );
+        assert_eq!(
+            super::compression_output_spec(Some("png")),
+            Some(("PNG", vec!["png"], "png"))
+        );
+        assert_eq!(
+            super::compression_output_spec(Some("webp")),
+            Some(("WebP", vec!["webp"], "webp"))
+        );
+        assert_eq!(super::compression_output_spec(Some("gif")), None);
+        assert_eq!(super::compression_output_spec(None), None);
+    }
+
+    #[test]
     fn corrected_output_extension_does_not_overwrite_an_unconfirmed_file() {
         let dir = test_dir("output-extension-collision");
         let picked = dir.join("photo.png");
@@ -2383,13 +2571,22 @@ mod tests {
             .map(|action| action.id.as_str())
             .collect();
 
-        assert_eq!(enabled, ["images.convert_to_pdf", "images.convert_format"]);
-        assert!(actions.iter().any(|action| !action.enabled));
-        assert_eq!(super::max_files_for_action("images.convert_format"), 1);
         assert_eq!(
-            super::filter_for_action("images.convert_format"),
-            Some(("Images", &["png", "jpg", "jpeg", "webp"][..]))
+            enabled,
+            [
+                "images.convert_to_pdf",
+                "images.convert_format",
+                "images.compress"
+            ]
         );
+        assert!(actions.iter().any(|action| !action.enabled));
+        for id in ["images.convert_format", "images.compress"] {
+            assert_eq!(super::max_files_for_action(id), 1);
+            assert_eq!(
+                super::filter_for_action(id),
+                Some(("Images", &["png", "jpg", "jpeg", "webp"][..]))
+            );
+        }
 
         let pdf_actions = super::category_actions("pdf");
         assert!(

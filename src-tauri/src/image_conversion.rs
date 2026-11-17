@@ -426,7 +426,7 @@ pub fn convert_image_with_progress(
     })
 }
 
-fn read_input(path: &Path) -> Result<Vec<u8>, ImageConversionError> {
+pub(crate) fn read_input(path: &Path) -> Result<Vec<u8>, ImageConversionError> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -460,7 +460,7 @@ fn read_input(path: &Path) -> Result<Vec<u8>, ImageConversionError> {
     })
 }
 
-fn decode_limits() -> Limits {
+pub(crate) fn decode_limits() -> Limits {
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_DIMENSION);
     limits.max_image_height = Some(MAX_DIMENSION);
@@ -482,7 +482,7 @@ fn decode_error(path: &Path, error: image::ImageError) -> ImageConversionError {
 
 /// Detects the format from `bytes`, checks the limits, and returns a decoder
 /// positioned to decode the pixels.
-fn open_decoder(
+pub(crate) fn open_decoder(
     path: &Path,
     bytes: Vec<u8>,
 ) -> Result<(impl ImageDecoder + 'static, ImageSource), ImageConversionError> {
@@ -616,7 +616,7 @@ fn flatten_alpha(rgba: &[u8], background: [u8; 3]) -> Vec<u8> {
 }
 
 /// Decodes the header of the encoded output and checks it is what was asked for.
-fn validate_encoded(
+pub(crate) fn validate_encoded(
     output: &Path,
     encoded: &[u8],
     format: ImageFormat,
@@ -651,7 +651,7 @@ fn validate_encoded(
     Ok(())
 }
 
-fn validate_output(
+pub(crate) fn validate_output(
     input: &Path,
     output: &Path,
     allow_overwrite: bool,
@@ -685,7 +685,7 @@ fn validate_output(
     Ok(())
 }
 
-fn write_safely(
+pub(crate) fn write_safely(
     output: &Path,
     bytes: &[u8],
     allow_overwrite: bool,

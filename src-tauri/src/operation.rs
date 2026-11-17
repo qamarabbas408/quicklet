@@ -241,10 +241,13 @@ fn describe_stage(stage: &str, completed: u64, total: u64) -> (String, Option<&'
         "validating" => ("Validating PDF", None),
         "finalizing" => ("Finalizing PDF", None),
         "reading-image" => ("Reading image", None),
+        "reading-metadata" => ("Reading metadata", None),
         "decoding" => ("Decoding image", None),
         "orienting" => ("Applying orientation", None),
         "encoding" => ("Encoding image", None),
+        "validating-image" => ("Validating image", None),
         "saving-image" => ("Saving image", None),
+        "copying-image" => ("Copying original image", None),
         _ => ("Working", None),
     };
     if total > 0 {
