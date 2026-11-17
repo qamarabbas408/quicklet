@@ -155,6 +155,7 @@ export type ConversionResult = {
   directory: string;
   files?: ConversionFile[];
   compression?: CompressionReport;
+  image?: ConversionImage;
 };
 
 export type OperationProgressStatus =
@@ -181,4 +182,52 @@ export type OperationProgress = {
   etaSeconds?: number;
   error?: string;
   output?: OperationProgressOutput;
+};
+
+export type ImageFormat = "png" | "jpeg" | "webp";
+
+export type ImageFormatOption = {
+  id: ImageFormat;
+  label: string;
+  extension: string;
+  lossy: boolean;
+  supportsAlpha: boolean;
+};
+
+export type ImageSourceInfo = {
+  name: string;
+  format: ImageFormat;
+  formatLabel: string;
+  width: number;
+  height: number;
+  bytes: number;
+  hasAlpha: boolean;
+  /** EXIF orientation 1–8 as stored in the file. */
+  orientation: number;
+  /** Every supported format except the source's own. */
+  destinations: ImageFormatOption[];
+  defaultJpegQuality: number;
+  maxInputBytes: number;
+  maxDimension: number;
+  maxPixels: number;
+};
+
+/** Fill for transparent areas when converting to JPEG. */
+export type ImageBackground = "white" | "black";
+
+export const IMAGE_BACKGROUNDS: Record<
+  ImageBackground,
+  { label: string; hex: string }
+> = {
+  white: { label: "White", hex: "#ffffff" },
+  black: { label: "Black", hex: "#000000" },
+};
+
+export type ConversionImage = {
+  format: ImageFormat;
+  formatLabel: string;
+  width: number;
+  height: number;
+  hadAlpha: boolean;
+  flattened: boolean;
 };

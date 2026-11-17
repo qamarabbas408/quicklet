@@ -1,4 +1,5 @@
 pub mod compress;
+pub mod image_conversion;
 pub mod merge;
 pub mod naming;
 pub mod operation;
@@ -8,6 +9,8 @@ pub mod pdf_preview;
 pub mod progress;
 pub mod rotate;
 pub mod split;
+#[cfg(test)]
+pub(crate) mod test_images;
 
 use chrono::Local;
 use std::collections::HashMap;
@@ -104,6 +107,47 @@ struct ConversionResult {
     files: Option<Vec<ConversionFile>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compression: Option<ConversionCompression>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<ConversionImage>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversionImage {
+    format: String,
+    format_label: String,
+    width: u32,
+    height: u32,
+    had_alpha: bool,
+    flattened: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageFormatOption {
+    id: String,
+    label: String,
+    extension: String,
+    lossy: bool,
+    supports_alpha: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageSourceInfo {
+    name: String,
+    format: String,
+    format_label: String,
+    width: u32,
+    height: u32,
+    bytes: u64,
+    has_alpha: bool,
+    orientation: u8,
+    destinations: Vec<ImageFormatOption>,
+    default_jpeg_quality: u8,
+    max_input_bytes: u64,
+    max_dimension: u32,
+    max_pixels: u64,
 }
 
 struct ConversionBusyGuard {
@@ -198,6 +242,7 @@ fn file_result(output: &Path, pages: usize, bytes_written: u64) -> ConversionRes
         directory,
         files: None,
         compression: None,
+        image: None,
     }
 }
 
@@ -548,6 +593,7 @@ async fn choose_output(
     app: AppHandle,
     window: WebviewWindow,
     preset: Option<String>,
+    format: Option<String>,
 ) -> Result<Option<OutputInfo>, String> {
     let state = app.state::<InputState>();
     ensure_not_converting(&state)?;
@@ -567,28 +613,44 @@ async fn choose_output(
         return Err("Add files before choosing an output.".to_string());
     }
 
-    let compression_preset = if action_id == "pdf.compress" {
-        let preset = preset
+    let (title, filter, extension, default_name) = if action_id == "images.convert_format" {
+        let format = format
             .as_deref()
-            .ok_or_else(|| "Choose a compression preset first.".to_string())?;
-        Some(
-            compress::CompressionPreset::parse(preset)
-                .ok_or_else(|| "Choose a valid compression preset.".to_string())?,
+            .and_then(image_conversion::ImageFormat::parse)
+            .ok_or_else(|| "Choose an output format first.".to_string())?;
+        let extension = format.extension();
+        (
+            "Save image",
+            (format.label(), vec![extension]),
+            extension,
+            naming::image_output_name(&files[0].path, extension, Local::now()),
         )
     } else {
-        None
+        let compression_preset = if action_id == "pdf.compress" {
+            let preset = preset
+                .as_deref()
+                .ok_or_else(|| "Choose a compression preset first.".to_string())?;
+            Some(
+                compress::CompressionPreset::parse(preset)
+                    .ok_or_else(|| "Choose a valid compression preset.".to_string())?,
+            )
+        } else {
+            None
+        };
+        let default_name =
+            naming::default_output_name(&action_id, compression_preset, Local::now())
+                .ok_or_else(|| "This action does not use a single output file.".to_string())?;
+        ("Save PDF", ("PDF", vec!["pdf"]), "pdf", default_name)
     };
-    let default_name = naming::default_output_name(&action_id, compression_preset, Local::now())
-        .ok_or_else(|| "This action does not use a single output file.".to_string())?;
 
     state.dialog_open.store(true, Ordering::SeqCst);
 
     let dialog = app
         .dialog()
         .file()
-        .set_title("Save PDF")
+        .set_title(title)
         .set_parent(&window)
-        .add_filter("PDF", &["pdf"])
+        .add_filter(filter.0, &filter.1)
         .set_file_name(default_name);
 
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -607,15 +669,11 @@ async fn choose_output(
         return Ok(None);
     };
 
-    let path = ensure_pdf_extension(file_path.into_path().map_err(|error| error.to_string())?);
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "output.pdf".to_string());
-    let directory = path
-        .parent()
-        .map(|directory| directory.display().to_string())
-        .unwrap_or_default();
+    let path = ensure_output_path(
+        file_path.into_path().map_err(|error| error.to_string())?,
+        extension,
+    )?;
+    let (name, directory) = file_name_and_directory(&path);
 
     clear_outputs(&state);
     if let Ok(mut output_path) = state.output_path.lock() {
@@ -815,6 +873,7 @@ async fn split_pdf(
         directory: output_directory.display().to_string(),
         files: Some(files),
         compression: None,
+        image: None,
     })
 }
 
@@ -1044,6 +1103,96 @@ async fn render_pdf_thumbnails(
 }
 
 #[tauri::command]
+async fn inspect_image_source(app: AppHandle) -> Result<ImageSourceInfo, String> {
+    let path = single_input_path(&app, "images.convert_format", "Select exactly one image.")?;
+    let task_path = path.clone();
+
+    let source =
+        tauri::async_runtime::spawn_blocking(move || image_conversion::inspect_image(&task_path))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+
+    Ok(ImageSourceInfo {
+        name: file_name_and_directory(&path).0,
+        format: source.format.id().to_string(),
+        format_label: source.format.label().to_string(),
+        width: source.width,
+        height: source.height,
+        bytes: source.bytes,
+        has_alpha: source.has_alpha,
+        orientation: source.orientation,
+        destinations: source
+            .format
+            .destinations()
+            .into_iter()
+            .map(|format| ImageFormatOption {
+                id: format.id().to_string(),
+                label: format.label().to_string(),
+                extension: format.extension().to_string(),
+                lossy: format.is_lossy(),
+                supports_alpha: format.supports_alpha(),
+            })
+            .collect(),
+        default_jpeg_quality: image_conversion::DEFAULT_JPEG_QUALITY,
+        max_input_bytes: image_conversion::MAX_INPUT_BYTES,
+        max_dimension: image_conversion::MAX_DIMENSION,
+        max_pixels: image_conversion::MAX_PIXELS,
+    })
+}
+
+#[tauri::command]
+async fn convert_image(
+    app: AppHandle,
+    format: String,
+    quality: Option<u8>,
+    background: Option<String>,
+) -> Result<ConversionResult, String> {
+    let path = single_input_path(&app, "images.convert_format", "Select exactly one image.")?;
+    let output = selected_output(&app.state::<InputState>())?;
+    let format = image_conversion::ImageFormat::parse(&format)
+        .ok_or_else(|| "Choose a valid output format.".to_string())?;
+    let mut options = image_conversion::ConversionOptions::new(format);
+    if let Some(quality) = quality {
+        options.jpeg_quality = quality;
+    }
+    if let Some(background) = background {
+        options.background = image_conversion::parse_background(&background)
+            .ok_or_else(|| "Choose a valid background colour.".to_string())?;
+    }
+
+    let task_output = output.clone();
+    let outcome = run_operation(
+        &app,
+        "images.convert_format",
+        "Image conversion",
+        OperationTarget::File(output.clone()),
+        move |progress| {
+            image_conversion::convert_image_with_progress(
+                &path,
+                &task_output,
+                options,
+                true,
+                progress,
+            )
+        },
+    )
+    .await?;
+
+    Ok(ConversionResult {
+        image: Some(ConversionImage {
+            format: outcome.format.id().to_string(),
+            format_label: outcome.format.label().to_string(),
+            width: outcome.width,
+            height: outcome.height,
+            had_alpha: outcome.had_alpha,
+            flattened: outcome.flattened,
+        }),
+        ..file_result(&output, 1, outcome.bytes_written)
+    })
+}
+
+#[tauri::command]
 async fn inspect_rotate_source(app: AppHandle) -> Result<RotateSourceInfo, String> {
     let path = single_input_path(&app, "pdf.rotate_pages", "Select exactly one PDF.")?;
     let task_path = path.clone();
@@ -1117,16 +1266,37 @@ fn open_output(app: AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn ensure_pdf_extension(path: PathBuf) -> PathBuf {
-    let has_pdf_extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
+/// Normalises the save-dialog path and prevents a corrected extension from
+/// silently overwriting a different existing file that the dialog did not ask
+/// about.
+fn ensure_output_path(path: PathBuf, extension: &str) -> Result<PathBuf, String> {
+    let normalized = ensure_extension(path.clone(), extension);
+    if normalized != path && normalized.exists() {
+        let name = normalized
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| normalized.display().to_string());
+        return Err(format!(
+            "A file named \"{name}\" already exists. Choose a different name or folder."
+        ));
+    }
+    Ok(normalized)
+}
 
-    if has_pdf_extension {
+/// Adds `extension` unless the path already has it (`jpg` also accepts `jpeg`).
+fn ensure_extension(path: PathBuf, extension: &str) -> PathBuf {
+    let current = path
+        .extension()
+        .and_then(|current| current.to_str())
+        .map(str::to_ascii_lowercase);
+    let matches = current.as_deref().is_some_and(|current| {
+        current == extension || (extension == "jpg" && current == "jpeg")
+    });
+
+    if matches {
         path
     } else {
-        path.with_extension("pdf")
+        path.with_extension(extension)
     }
 }
 
@@ -1385,7 +1555,8 @@ fn compress_input_path(app: &AppHandle) -> Result<PathBuf, String> {
 fn max_files_for_action(action_id: &str) -> usize {
     if matches!(
         action_id,
-        "pdf.split"
+        "images.convert_format"
+            | "pdf.split"
             | "pdf.compress"
             | "pdf.extract_pages"
             | "pdf.delete_pages"
@@ -1400,6 +1571,7 @@ fn max_files_for_action(action_id: &str) -> usize {
 fn action_input_kind(action_id: &str) -> Option<&'static str> {
     match action_id {
         "images.convert_to_pdf" => Some("images"),
+        "images.convert_format" => Some("image"),
         "pdf.merge" | "pdf.split" | "pdf.compress" | "pdf.extract_pages" | "pdf.delete_pages"
         | "pdf.rotate_pages" => Some("pdf"),
         _ => None,
@@ -1412,6 +1584,7 @@ fn filter_for_action(action_id: &str) -> Option<(&'static str, &'static [&'stati
             "Images",
             &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"],
         )),
+        Some("image") => Some(("Images", &["png", "jpg", "jpeg", "webp"])),
         Some("pdf") => Some(("PDF documents", &["pdf"])),
         Some("documents") => Some((
             "Documents",
@@ -1449,10 +1622,10 @@ fn category_actions(category_id: &str) -> Vec<ActionInfo> {
             ),
             action(
                 "images.convert_format",
-                "Convert format",
-                "PNG, JPEG, WebP, and more",
-                false,
-                Some("images"),
+                "Convert Image",
+                "Convert between PNG, JPEG, and WebP",
+                true,
+                Some("image"),
             ),
             action(
                 "images.resize_compress",
@@ -1966,6 +2139,8 @@ pub fn run() {
             plan_page_selection,
             extract_pages,
             delete_pages,
+            inspect_image_source,
+            convert_image,
             inspect_rotate_source,
             rotate_pages,
             render_pdf_thumbnails,
@@ -2168,15 +2343,53 @@ mod tests {
     }
 
     #[test]
-    fn action_catalog_exposes_one_enabled_image_action() {
-        let actions = super::category_actions("images");
-        let enabled: Vec<_> = actions.iter().filter(|action| action.enabled).collect();
+    fn ensure_extension_adds_only_when_missing() {
+        use std::path::PathBuf;
 
-        assert_eq!(enabled.len(), 1);
-        assert_eq!(enabled[0].id, "images.convert_to_pdf");
+        let fix = |name: &str, extension: &str| {
+            super::ensure_extension(PathBuf::from(name), extension)
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(fix("photo", "jpg"), "photo.jpg");
+        assert_eq!(fix("photo.JPEG", "jpg"), "photo.JPEG");
+        assert_eq!(fix("photo.png", "jpg"), "photo.jpg");
+        assert_eq!(fix("scan.PDF", "pdf"), "scan.PDF");
+        assert_eq!(fix("scan.txt", "pdf"), "scan.pdf");
+    }
+
+    #[test]
+    fn corrected_output_extension_does_not_overwrite_an_unconfirmed_file() {
+        let dir = test_dir("output-extension-collision");
+        let picked = dir.join("photo.png");
+        let normalized_existing = dir.join("photo.jpg");
+        std::fs::write(&normalized_existing, b"existing").expect("existing output");
+
+        assert!(super::ensure_output_path(picked, "jpg").is_err());
+
+        let fresh = super::ensure_output_path(dir.join("fresh.png"), "jpg")
+            .expect("fresh output should be accepted");
+        assert_eq!(fresh, dir.join("fresh.jpg"));
+
+        std::fs::remove_dir_all(dir).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn action_catalog_exposes_enabled_image_actions() {
+        let actions = super::category_actions("images");
+        let enabled: Vec<_> = actions
+            .iter()
+            .filter(|action| action.enabled)
+            .map(|action| action.id.as_str())
+            .collect();
+
+        assert_eq!(enabled, ["images.convert_to_pdf", "images.convert_format"]);
         assert!(actions.iter().any(|action| !action.enabled));
-        assert!(super::find_action("images.convert_to_pdf").is_some());
-        assert!(super::find_action("images.convert_format").is_some());
+        assert_eq!(super::max_files_for_action("images.convert_format"), 1);
+        assert_eq!(
+            super::filter_for_action("images.convert_format"),
+            Some(("Images", &["png", "jpg", "jpeg", "webp"][..]))
+        );
 
         let pdf_actions = super::category_actions("pdf");
         assert!(
@@ -2263,11 +2476,11 @@ mod tests {
     #[test]
     fn normalizes_pdf_output_paths() {
         assert_eq!(
-            super::ensure_pdf_extension(std::path::PathBuf::from("/tmp/out")),
+            super::ensure_extension(std::path::PathBuf::from("/tmp/out"), "pdf"),
             std::path::PathBuf::from("/tmp/out.pdf")
         );
         assert_eq!(
-            super::ensure_pdf_extension(std::path::PathBuf::from("/tmp/out.PDF")),
+            super::ensure_extension(std::path::PathBuf::from("/tmp/out.PDF"), "pdf"),
             std::path::PathBuf::from("/tmp/out.PDF")
         );
     }

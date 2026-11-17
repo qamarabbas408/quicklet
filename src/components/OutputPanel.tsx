@@ -2,6 +2,9 @@ import type {
   CompressionPreset,
   CompressionSourceInfo,
   ConversionResult,
+  ImageBackground,
+  ImageFormat,
+  ImageSourceInfo,
   OperationProgress,
   OutputDirectoryInfo,
   OutputInfo,
@@ -12,6 +15,7 @@ import type {
   SplitMode,
   SplitPlan,
 } from "../lib/actions";
+import { IMAGE_BACKGROUNDS } from "../lib/actions";
 import type { InputSelection } from "../lib/input";
 import { formatBytes, formatFileCount, formatPageRanges } from "../lib/format";
 
@@ -26,6 +30,11 @@ type OutputPanelProps = {
   isMerge: boolean;
   isSplit: boolean;
   isCompress: boolean;
+  isImageConvert: boolean;
+  imageSource: ImageSourceInfo | null;
+  imageFormat: ImageFormat | null;
+  imageQuality: number;
+  imageBackground: ImageBackground;
   compressionPreset: CompressionPreset;
   compressSource: CompressionSourceInfo | null;
   pageSelectionMode: PageSelectionMode | null;
@@ -61,6 +70,11 @@ export function OutputPanel({
   isMerge,
   isSplit,
   isCompress,
+  isImageConvert,
+  imageSource,
+  imageFormat,
+  imageQuality,
+  imageBackground,
   compressionPreset,
   compressSource,
   pageSelectionMode,
@@ -107,7 +121,22 @@ export function OutputPanel({
   const splitIncluded = splitPlan
     ? splitPlan.outputs.reduce((sum, item) => sum + item.pages.length, 0)
     : 0;
-  const busyLabel = isSplit
+  const imageDestination =
+    imageSource?.destinations.find((option) => option.id === imageFormat) ??
+    null;
+  const imageDimensions = imageSource
+    ? imageSource.orientation >= 5
+      ? `${imageSource.height}×${imageSource.width}`
+      : `${imageSource.width}×${imageSource.height}`
+    : null;
+  const imageDimensionsSuffix = imageSource
+    ? imageSource.orientation === 1
+      ? " (unchanged)"
+      : " after EXIF rotation"
+    : "";
+  const busyLabel = isImageConvert
+    ? "Converting image…"
+    : isSplit
     ? "Splitting PDF…"
     : isMerge
       ? "Merging PDFs…"
@@ -153,7 +182,9 @@ export function OutputPanel({
       : progress && progress.determinate
         ? "Estimating time remaining…"
         : null;
-  const actionLabelForButton = isSplit
+  const actionLabelForButton = isImageConvert
+    ? "Convert Image"
+    : isSplit
     ? "Split PDF"
     : isMerge
       ? "Merge PDFs"
@@ -221,7 +252,9 @@ export function OutputPanel({
               className="truncate text-sm font-semibold text-white"
             >
               {result
-                ? isCompress
+                ? result.image
+                  ? "Image converted"
+                  : isCompress
                   ? "Compression complete"
                   : isRotate
                     ? "Pages rotated"
@@ -284,10 +317,26 @@ export function OutputPanel({
                 <p className="mt-1 truncate text-[10px] text-white/40">
                   {result.directory}
                 </p>
-                <p className="mt-2 text-[10px] text-white/45">
-                  {result.pages} {result.pages === 1 ? "page" : "pages"} ·{" "}
-                  {formatBytes(result.bytesWritten)}
-                </p>
+                {result.image ? (
+                  <>
+                    <p className="mt-2 text-[10px] text-white/45">
+                      {result.image.width}×{result.image.height} ·{" "}
+                      {result.image.formatLabel} ·{" "}
+                      {formatBytes(result.bytesWritten)}
+                    </p>
+                    {result.image.flattened && (
+                      <p className="mt-1 text-[10px] text-amber-200/85">
+                        Transparent areas were filled with{" "}
+                        {IMAGE_BACKGROUNDS[imageBackground].label.toLowerCase()}.
+                      </p>
+                    )}
+                  </>
+                ) : (
+                  <p className="mt-2 text-[10px] text-white/45">
+                    {result.pages} {result.pages === 1 ? "page" : "pages"} ·{" "}
+                    {formatBytes(result.bytesWritten)}
+                  </p>
+                )}
               </div>
             )}
 
@@ -377,12 +426,55 @@ export function OutputPanel({
               className="w-full rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-white/70 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"
               onClick={hasFileList ? onOpenFolder : onOpen}
             >
-              {hasFileList ? "Open folder" : "Open PDF"}
+              {hasFileList
+                ? "Open folder"
+                : result.image
+                  ? "Open image"
+                  : "Open PDF"}
             </button>
           </>
         ) : (
           <>
-            {isRotate ? (
+            {isImageConvert ? (
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Format</span>
+                  <span className="text-white/85">
+                    {imageDestination?.label ?? "—"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Source</span>
+                  <span className="text-white/85">
+                    {imageSource?.formatLabel ?? "—"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Dimensions</span>
+                  <span className="text-white/85">
+                    {imageDimensions
+                      ? `${imageDimensions}${imageDimensionsSuffix}`
+                      : "—"}
+                  </span>
+                </div>
+                {imageDestination?.lossy && (
+                  <div className="mt-1 flex items-center justify-between text-[11px]">
+                    <span className="text-white/45">Quality</span>
+                    <span className="text-white/85">{imageQuality}</span>
+                  </div>
+                )}
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Transparency</span>
+                  <span className="text-white/85">
+                    {!imageSource?.hasAlpha
+                      ? "None"
+                      : imageDestination?.supportsAlpha === false
+                        ? `Filled with ${IMAGE_BACKGROUNDS[imageBackground].label.toLowerCase()}`
+                        : "Preserved"}
+                  </span>
+                </div>
+              </div>
+            ) : isRotate ? (
               <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
                 <div className="flex items-center justify-between text-[11px]">
                   <span className="text-white/45">Format</span>
@@ -679,7 +771,9 @@ export function OutputPanel({
                   ? "Page preview"
                   : isPageSelection
                     ? "Page selection"
-                    : "Review files"}
+                    : isImageConvert
+                      ? "Conversion settings"
+                      : "Review files"}
           </button>
           <span className="text-white/30">Esc to dismiss</span>
         </div>
