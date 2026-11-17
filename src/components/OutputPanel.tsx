@@ -3,6 +3,7 @@ import type {
   CompressionSourceInfo,
   ConversionResult,
   ImageBackground,
+  ImageCompressionSourceInfo,
   ImageFormat,
   ImageSourceInfo,
   OperationProgress,
@@ -31,10 +32,13 @@ type OutputPanelProps = {
   isSplit: boolean;
   isCompress: boolean;
   isImageConvert: boolean;
+  isImageCompress: boolean;
   imageSource: ImageSourceInfo | null;
   imageFormat: ImageFormat | null;
   imageQuality: number;
   imageBackground: ImageBackground;
+  imageCompressionSource: ImageCompressionSourceInfo | null;
+  imageCompressionQuality: number;
   compressionPreset: CompressionPreset;
   compressSource: CompressionSourceInfo | null;
   pageSelectionMode: PageSelectionMode | null;
@@ -71,10 +75,13 @@ export function OutputPanel({
   isSplit,
   isCompress,
   isImageConvert,
+  isImageCompress,
   imageSource,
   imageFormat,
   imageQuality,
   imageBackground,
+  imageCompressionSource,
+  imageCompressionQuality,
   compressionPreset,
   compressSource,
   pageSelectionMode,
@@ -105,6 +112,7 @@ export function OutputPanel({
   const files = result?.files ?? [];
   const hasFileList = files.length > 0;
   const compression = result?.compression;
+  const imageCompression = result?.imageCompression;
   const isPageSelection = pageSelectionMode !== null;
   const isExtract = pageSelectionMode === "extract";
   const rotatePages = Object.keys(rotateTurns)
@@ -134,9 +142,11 @@ export function OutputPanel({
       ? " (unchanged)"
       : " after EXIF rotation"
     : "";
-  const busyLabel = isImageConvert
-    ? "Converting image…"
-    : isSplit
+  const busyLabel = isImageCompress
+    ? "Compressing image…"
+    : isImageConvert
+      ? "Converting image…"
+      : isSplit
     ? "Splitting PDF…"
     : isMerge
       ? "Merging PDFs…"
@@ -182,9 +192,11 @@ export function OutputPanel({
       : progress && progress.determinate
         ? "Estimating time remaining…"
         : null;
-  const actionLabelForButton = isImageConvert
-    ? "Convert Image"
-    : isSplit
+  const actionLabelForButton = isImageCompress
+    ? "Compress Image"
+    : isImageConvert
+      ? "Convert Image"
+      : isSplit
     ? "Split PDF"
     : isMerge
       ? "Merge PDFs"
@@ -197,8 +209,10 @@ export function OutputPanel({
               ? "Extract Pages"
               : "Delete Pages"
             : "Convert to PDF";
-  const retryLabel = isSplit
-    ? "Retry split"
+  const retryLabel = isImageCompress
+    ? "Retry compression"
+    : isSplit
+      ? "Retry split"
     : isMerge
       ? "Retry merge"
       : isCompress
@@ -252,9 +266,13 @@ export function OutputPanel({
               className="truncate text-sm font-semibold text-white"
             >
               {result
-                ? result.image
-                  ? "Image converted"
-                  : isCompress
+                ? imageCompression
+                  ? imageCompression.status === "no-reduction"
+                    ? "No reduction"
+                    : "Image compressed"
+                  : result.image
+                    ? "Image converted"
+                    : isCompress
                   ? "Compression complete"
                   : isRotate
                     ? "Pages rotated"
@@ -317,7 +335,31 @@ export function OutputPanel({
                 <p className="mt-1 truncate text-[10px] text-white/40">
                   {result.directory}
                 </p>
-                {result.image ? (
+                {imageCompression ? (
+                  <>
+                    <p className="mt-2 text-[10px] text-white/45">
+                      {imageCompression.width}×{imageCompression.height} ·{" "}
+                      {imageCompression.formatLabel} ·{" "}
+                      {formatBytes(imageCompression.outputBytes)}
+                    </p>
+                    <p className="mt-1 text-[10px] text-white/45">
+                      Original {formatBytes(imageCompression.originalBytes)} ·{" "}
+                      Saved {formatBytes(imageCompression.savedBytes)} (
+                      {imageCompression.reductionPercent.toFixed(1)}%)
+                    </p>
+                    {imageCompression.status === "no-reduction" ? (
+                      <p className="mt-1 text-[10px] text-amber-200/85">
+                        No reduction — the exact original bytes were copied.
+                        All original metadata is retained.
+                      </p>
+                    ) : (
+                      <p className="mt-1 text-[10px] text-white/40">
+                        ICC/EXIF preserved where present. XMP/IPTC and
+                        unsupported ancillary metadata were removed.
+                      </p>
+                    )}
+                  </>
+                ) : result.image ? (
                   <>
                     <p className="mt-2 text-[10px] text-white/45">
                       {result.image.width}×{result.image.height} ·{" "}
@@ -428,14 +470,54 @@ export function OutputPanel({
             >
               {hasFileList
                 ? "Open folder"
-                : result.image
+                : result.image || result.imageCompression
                   ? "Open image"
                   : "Open PDF"}
             </button>
           </>
         ) : (
           <>
-            {isImageConvert ? (
+            {isImageCompress ? (
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Format</span>
+                  <span className="text-white/85">
+                    {imageCompressionSource?.formatLabel ?? "—"} (unchanged)
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Dimensions</span>
+                  <span className="text-white/85">
+                    {imageCompressionSource
+                      ? `${imageCompressionSource.width}×${imageCompressionSource.height} (unchanged)`
+                      : "—"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Method</span>
+                  <span className="text-white/85">
+                    {imageCompressionSource?.format === "jpeg"
+                      ? `JPEG quality ${imageCompressionQuality}`
+                      : imageCompressionSource?.format === "png"
+                        ? "PNG lossless"
+                        : "WebP lossless"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[11px]">
+                  <span className="text-white/45">Transparency</span>
+                  <span className="text-white/85">
+                    {imageCompressionSource?.hasAlpha ? "Preserved" : "None"}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-start justify-between gap-3 text-[11px]">
+                  <span className="shrink-0 text-white/45">Metadata</span>
+                  <span className="text-right text-white/70">
+                    ICC/EXIF preserved; XMP/IPTC and ancillary metadata removed
+                    if the file is reduced.
+                  </span>
+                </div>
+              </div>
+            ) : isImageConvert ? (
               <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
                 <div className="flex items-center justify-between text-[11px]">
                   <span className="text-white/45">Format</span>
@@ -763,11 +845,13 @@ export function OutputPanel({
             onClick={onBack}
           >
             &larr;{" "}
-            {isSplit
-              ? "Split settings"
-              : isCompress
-                ? "Compression settings"
-                : isRotate
+            {isImageCompress
+              ? "Compression settings"
+              : isSplit
+                ? "Split settings"
+                : isCompress
+                  ? "Compression settings"
+                  : isRotate
                   ? "Page preview"
                   : isPageSelection
                     ? "Page selection"

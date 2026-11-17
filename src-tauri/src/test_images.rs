@@ -7,6 +7,7 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::{ExtendedColorType, ImageEncoder, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
+use miniz_oxide::deflate::compress_to_vec_zlib;
 
 pub fn write_png(path: &Path, width: u32, height: u32, alpha: bool) {
     let mut image = RgbaImage::new(width, height);
@@ -202,5 +203,115 @@ pub fn write_webp_image(path: &Path, image: &RgbaImage, orientation: Option<u16>
     bytes.extend_from_slice(&vp8x);
     bytes.extend_from_slice(vp8l);
     bytes.extend_from_slice(&exif);
+    fs::write(path, bytes).unwrap();
+}
+
+pub fn write_png_with_metadata(
+    path: &Path,
+    image: &RgbaImage,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
+) {
+    let mut bytes = Vec::new();
+    let mut encoder = PngEncoder::new(&mut bytes);
+    if let Some(icc) = icc {
+        encoder.set_icc_profile(icc.to_vec()).unwrap();
+    }
+    if let Some(exif) = exif {
+        encoder.set_exif_metadata(exif.to_vec()).unwrap();
+    }
+    encoder
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+    fs::write(path, bytes).unwrap();
+}
+
+pub fn write_jpeg_with_metadata(
+    path: &Path,
+    image: &RgbImage,
+    quality: u8,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
+) {
+    let mut bytes = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut bytes, quality);
+    if let Some(icc) = icc {
+        encoder.set_icc_profile(icc.to_vec()).unwrap();
+    }
+    if let Some(exif) = exif {
+        encoder.set_exif_metadata(exif.to_vec()).unwrap();
+    }
+    encoder
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    fs::write(path, bytes).unwrap();
+}
+
+pub fn write_webp_with_metadata(
+    path: &Path,
+    image: &RgbaImage,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
+) {
+    let mut bytes = Vec::new();
+    let mut encoder = WebPEncoder::new_lossless(&mut bytes);
+    if let Some(icc) = icc {
+        encoder.set_icc_profile(icc.to_vec()).unwrap();
+    }
+    if let Some(exif) = exif {
+        encoder.set_exif_metadata(exif.to_vec()).unwrap();
+    }
+    encoder
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+    fs::write(path, bytes).unwrap();
+}
+/// Writes a true 8-bit indexed PNG. The compressed fixture exercises the
+/// palette-expansion path in the `image` decoder.
+pub fn write_indexed_png(
+    path: &Path,
+    width: u32,
+    height: u32,
+    palette: &[[u8; 3]],
+    indices: &[u8],
+) {
+    assert_eq!(indices.len(), width as usize * height as usize);
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 3, 0, 0, 0]);
+
+    let mut plte = Vec::with_capacity(palette.len() * 3);
+    for color in palette {
+        plte.extend_from_slice(color);
+    }
+
+    let mut scanlines = Vec::with_capacity(height as usize * (width as usize + 1));
+    for y in 0..height as usize {
+        scanlines.push(0);
+        scanlines.extend_from_slice(&indices[y * width as usize..(y + 1) * width as usize]);
+    }
+    let idat = compress_to_vec_zlib(&scanlines, 6);
+
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend_from_slice(&png_chunk(b"IHDR", &ihdr));
+    bytes.extend_from_slice(&png_chunk(b"PLTE", &plte));
+    bytes.extend_from_slice(&png_chunk(b"IDAT", &idat));
+    bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
     fs::write(path, bytes).unwrap();
 }

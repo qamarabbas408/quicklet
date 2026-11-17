@@ -156,6 +156,7 @@ export type ConversionResult = {
   files?: ConversionFile[];
   compression?: CompressionReport;
   image?: ConversionImage;
+  imageCompression?: ImageCompressionReport;
 };
 
 export type OperationProgressStatus =
@@ -230,4 +231,43 @@ export type ConversionImage = {
   height: number;
   hadAlpha: boolean;
   flattened: boolean;
+};
+
+export type ImageMetadataSummary = {
+  hasIcc: boolean;
+  hasExif: boolean;
+  hasXmp: boolean;
+  hasIptc: boolean;
+  preservedBytes: number;
+};
+
+export type ImageCompressionSourceInfo = {
+  name: string;
+  format: ImageFormat;
+  formatLabel: string;
+  width: number;
+  height: number;
+  bytes: number;
+  hasAlpha: boolean;
+  orientation: number;
+  metadata: ImageMetadataSummary;
+  defaultJpegQuality: number;
+  maxInputBytes: number;
+  maxDimension: number;
+  maxPixels: number;
+};
+
+export type ImageCompressionReport = {
+  format: ImageFormat;
+  formatLabel: string;
+  width: number;
+  height: number;
+  originalBytes: number;
+  outputBytes: number;
+  savedBytes: number;
+  reductionPercent: number;
+  status: "reduced" | "no-reduction";
+  hadAlpha: boolean;
+  jpegQuality: number | null;
+  metadata: ImageMetadataSummary;
 };

@@ -5,6 +5,7 @@ import { AboutPanel } from "./AboutPanel";
 import { ActionList } from "./ActionList";
 import { CompressionSettings } from "./CompressionSettings";
 import { FileConfirmation } from "./FileConfirmation";
+import { ImageCompressionSettings } from "./ImageCompressionSettings";
 import { ImageFormatSettings } from "./ImageFormatSettings";
 import { OutputPanel } from "./OutputPanel";
 import { PageSelectionSettings } from "./PageSelectionSettings";
@@ -18,6 +19,7 @@ import type {
   CompressionSourceInfo,
   ConversionResult,
   ImageBackground,
+  ImageCompressionSourceInfo,
   ImageFormat,
   ImageSourceInfo,
   OperationProgress,
@@ -45,6 +47,7 @@ type Stage =
   | "configure"
   | "compression"
   | "image"
+  | "image-compress"
   | "pages"
   | "preview"
   | "output";
@@ -99,6 +102,11 @@ export function MenuWindow() {
   const [imageQuality, setImageQuality] = useState(85);
   const [imageBackground, setImageBackground] =
     useState<ImageBackground>("white");
+  const [isInspectingImageCompression, setIsInspectingImageCompression] =
+    useState(false);
+  const [imageCompressionSource, setImageCompressionSource] =
+    useState<ImageCompressionSourceInfo | null>(null);
+  const [imageCompressionQuality, setImageCompressionQuality] = useState(85);
   const [isInspectingPages, setIsInspectingPages] = useState(false);
   const [pageSource, setPageSource] = useState<PageSourceInfo | null>(null);
   const [pageSelection, setPageSelection] = useState("");
@@ -152,6 +160,9 @@ export function MenuWindow() {
     setImageFormat(null);
     setImageQuality(85);
     setImageBackground("white");
+    setIsInspectingImageCompression(false);
+    setImageCompressionSource(null);
+    setImageCompressionQuality(85);
     setIsInspectingPages(false);
     setPageSource(null);
     setPageSelection("");
@@ -402,6 +413,44 @@ export function MenuWindow() {
       setIsInspectingImage(false);
     }
   }, [isInspectingImage]);
+
+  const beginImageCompressionSetup = useCallback(async () => {
+    if (isInspectingImageCompression) return;
+
+    setIsInspectingImageCompression(true);
+    setPickerError(null);
+    setImageCompressionSource(null);
+
+    try {
+      const before = await invoke<InputSelection>("get_input");
+      const source = await invoke<ImageCompressionSourceInfo>(
+        "inspect_image_compression_source",
+      );
+      const after = await invoke<InputSelection>("get_input");
+
+      if (
+        after.files.length !== 1 ||
+        before.files[0]?.id !== after.files[0]?.id
+      ) {
+        setInputSelection(after);
+        setStage("input");
+        return;
+      }
+
+      setImageCompressionSource(source);
+      setImageCompressionQuality(source.defaultJpegQuality);
+      setOutputInfo(null);
+      setOutputError(null);
+      setConversionResult(null);
+      setConversionError(null);
+      setResultActionError(null);
+      setStage("image-compress");
+    } catch (error) {
+      setPickerError(String(error));
+    } finally {
+      setIsInspectingImageCompression(false);
+    }
+  }, [isInspectingImageCompression]);
 
   const beginPageSelectionSetup = useCallback(async () => {
     if (isInspectingPages) return;
@@ -816,6 +865,11 @@ export function MenuWindow() {
           quality: isJpeg ? imageQuality : null,
           background: isJpeg ? IMAGE_BACKGROUNDS[imageBackground].hex : null,
         });
+      } else if (selectedOperation?.id === "images.compress") {
+        const isJpeg = imageCompressionSource?.format === "jpeg";
+        result = await invoke<ConversionResult>("compress_image", {
+          quality: isJpeg ? imageCompressionQuality : null,
+        });
       } else if (selectedOperation?.id === "pdf.rotate_pages") {
         const changes = Object.entries(rotateTurns).map(([page, turns]) => ({
           page: Number(page),
@@ -897,6 +951,8 @@ export function MenuWindow() {
       setStage("compression");
     } else if (selectedOperation?.id === "images.convert_format") {
       setStage("image");
+    } else if (selectedOperation?.id === "images.compress") {
+      setStage("image-compress");
     } else if (selectedOperation?.id === "pdf.rotate_pages") {
       setOutputInfo(null);
       setOutputError(null);
@@ -984,12 +1040,17 @@ export function MenuWindow() {
     inputSelection !== null;
   const showImage =
     stage === "image" && selectedOperation !== null && imageSource !== null;
+  const showImageCompression =
+    stage === "image-compress" &&
+    selectedOperation !== null &&
+    imageCompressionSource !== null;
   const showOutput =
     stage === "output" && selectedOperation !== null && inputSelection !== null;
   const isSplit = selectedOperation?.id === "pdf.split";
   const isMerge = selectedOperation?.id === "pdf.merge";
   const isCompress = selectedOperation?.id === "pdf.compress";
   const isImageConvert = selectedOperation?.id === "images.convert_format";
+  const isImageCompress = selectedOperation?.id === "images.compress";
   const isExtractPages = selectedOperation?.id === "pdf.extract_pages";
   const isDeletePages = selectedOperation?.id === "pdf.delete_pages";
   const isRotate = selectedOperation?.id === "pdf.rotate_pages";
@@ -1008,10 +1069,14 @@ export function MenuWindow() {
         ? "PDFs"
         : isImageConvert
           ? "image"
-          : "images";
+          : isImageCompress
+            ? "image"
+            : "images";
   const continueLabel = isImageConvert
     ? "Choose format"
-    : isSplit
+    : isImageCompress
+      ? "Compression settings"
+      : isSplit
     ? "Configure split"
     : isCompress
       ? "Choose preset"
@@ -1059,7 +1124,9 @@ export function MenuWindow() {
                     ? isInspectingRotate
                     : isImageConvert
                       ? isInspectingImage
-                      : false
+                      : isImageCompress
+                        ? isInspectingImageCompression
+                        : false
           }
           isPicking={isPicking}
           isDropMode={isDropMode}
@@ -1080,6 +1147,8 @@ export function MenuWindow() {
               void beginCompressionSetup();
             } else if (isImageConvert) {
               void beginImageSetup();
+            } else if (isImageCompress) {
+              void beginImageCompressionSetup();
             } else if (isPageSelection) {
               void beginPageSelectionSetup();
             } else if (isRotate) {
@@ -1156,6 +1225,16 @@ export function MenuWindow() {
           onContinue={() => setStage("output")}
           onDismiss={dismiss}
         />
+      ) : showImageCompression ? (
+        <ImageCompressionSettings
+          source={imageCompressionSource}
+          quality={imageCompressionQuality}
+          categoryIcon={selectedAction?.icon}
+          onQualityChange={setImageCompressionQuality}
+          onBack={() => setStage("input")}
+          onContinue={() => setStage("output")}
+          onDismiss={dismiss}
+        />
       ) : showCompression ? (
         <CompressionSettings
           source={compressSource}
@@ -1221,10 +1300,13 @@ export function MenuWindow() {
           isSplit={isSplit}
           isCompress={isCompress}
           isImageConvert={isImageConvert}
+          isImageCompress={isImageCompress}
           imageSource={imageSource}
           imageFormat={imageFormat}
           imageQuality={imageQuality}
           imageBackground={imageBackground}
+          imageCompressionSource={imageCompressionSource}
+          imageCompressionQuality={imageCompressionQuality}
           compressionPreset={compressionPreset}
           compressSource={compressSource}
           pageSelectionMode={pageSelectionMode}
