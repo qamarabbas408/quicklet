@@ -336,7 +336,7 @@ fn compress(data: &[u8]) -> Vec<u8> {
     miniz_oxide::deflate::compress_to_vec_zlib(data, 6)
 }
 
-fn is_animated_webp(bytes: &[u8]) -> bool {
+pub(crate) fn is_animated_webp(bytes: &[u8]) -> bool {
     bytes.len() >= 21
         && &bytes[0..4] == b"RIFF"
         && &bytes[8..12] == b"WEBP"
@@ -601,99 +601,11 @@ fn write_safely(output: &Path, bytes: &[u8], allow_overwrite: bool) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::codecs::jpeg::JpegEncoder;
-    use image::codecs::webp::WebPEncoder;
-    use image::{ExtendedColorType, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
+    use crate::test_images::{write_jpeg, write_png, write_webp};
+    use image::{ImageFormat, Rgb, RgbImage};
     use lopdf::{Document, ObjectId};
     use std::fs;
     use tempfile::tempdir;
-
-    fn write_png(path: &Path, width: u32, height: u32, alpha: bool) {
-        let mut image = RgbaImage::new(width, height);
-        for (x, y, pixel) in image.enumerate_pixels_mut() {
-            let band = x * 4 / width.max(1);
-            let color: [u8; 3] = match band {
-                0 => [230, 60, 70],
-                1 => [60, 180, 90],
-                2 => [60, 90, 230],
-                _ => [240, 200, 60],
-            };
-            let alpha = if alpha && x < width / 2 { 0 } else { 255 };
-            let shade = (y * 30 / height.max(1)) as u8;
-            *pixel = Rgba([
-                color[0].saturating_add(shade),
-                color[1].saturating_add(shade),
-                color[2].saturating_add(shade),
-                alpha,
-            ]);
-        }
-        image.save_with_format(path, ImageFormat::Png).unwrap();
-    }
-
-    fn write_jpeg(path: &Path, width: u32, height: u32, orientation: Option<u16>) {
-        let mut image = RgbImage::new(width, height);
-        for (x, y, pixel) in image.enumerate_pixels_mut() {
-            *pixel = Rgb([
-                (x * 255 / width.max(1)) as u8,
-                (y * 255 / height.max(1)) as u8,
-                128,
-            ]);
-        }
-        let mut file = fs::File::create(path).unwrap();
-        JpegEncoder::new_with_quality(&mut file, 90)
-            .encode(image.as_raw(), width, height, ExtendedColorType::Rgb8)
-            .unwrap();
-        drop(file);
-
-        if let Some(orientation) = orientation {
-            let bytes = fs::read(path).unwrap();
-            let segment = exif_orientation_segment(orientation);
-            let mut with_exif = Vec::with_capacity(bytes.len() + segment.len());
-            with_exif.extend_from_slice(&bytes[..2]);
-            with_exif.extend_from_slice(&segment);
-            with_exif.extend_from_slice(&bytes[2..]);
-            fs::write(path, with_exif).unwrap();
-        }
-    }
-
-    fn exif_orientation_segment(orientation: u16) -> Vec<u8> {
-        let mut tiff = Vec::new();
-        tiff.extend_from_slice(b"II*\0");
-        tiff.extend_from_slice(&8u32.to_le_bytes());
-        tiff.extend_from_slice(&1u16.to_le_bytes());
-        tiff.extend_from_slice(&0x0112u16.to_le_bytes());
-        tiff.extend_from_slice(&3u16.to_le_bytes());
-        tiff.extend_from_slice(&1u32.to_le_bytes());
-        tiff.extend_from_slice(&orientation.to_le_bytes());
-        tiff.extend_from_slice(&0u16.to_le_bytes());
-        tiff.extend_from_slice(&0u32.to_le_bytes());
-
-        let mut payload = b"Exif\0\0".to_vec();
-        payload.extend_from_slice(&tiff);
-        let length = (payload.len() + 2) as u16;
-
-        let mut segment = vec![0xFF, 0xE1];
-        segment.extend_from_slice(&length.to_be_bytes());
-        segment.extend_from_slice(&payload);
-        segment
-    }
-
-    fn write_webp(path: &Path, width: u32, height: u32) {
-        let mut image = RgbImage::new(width, height);
-        for (x, y, pixel) in image.enumerate_pixels_mut() {
-            let stripe = (x / 5) % 2 == 0;
-            let shade = (y * 40 / height.max(1)) as u8;
-            *pixel = if stripe {
-                Rgb([40 + shade, 130, 220])
-            } else {
-                Rgb([245, 245, 245])
-            };
-        }
-        let file = fs::File::create(path).unwrap();
-        WebPEncoder::new_lossless(file)
-            .encode(image.as_raw(), width, height, ExtendedColorType::Rgb8)
-            .unwrap();
-    }
 
     fn write_large_png(path: &Path) {
         let width = 3000;

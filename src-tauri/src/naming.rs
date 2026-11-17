@@ -30,6 +30,24 @@ pub fn default_output_name(
     Some(format!("Quicklet-{action}-{}.pdf", format_timestamp(now)))
 }
 
+/// `photo.png` converted to WebP becomes
+/// `Quicklet-Convert-photo-YYYYMMDD-HHMMSS.webp`.
+pub fn image_output_name(
+    source: &std::path::Path,
+    extension: &str,
+    now: DateTime<Local>,
+) -> String {
+    let stem = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = sanitize_stem(&stem, "Image", false);
+    format!(
+        "Quicklet-Convert-{stem}-{}.{extension}",
+        format_timestamp(now)
+    )
+}
+
 pub fn split_output_name(stem: &str, start: usize, end: usize) -> String {
     let stem = sanitize_source_stem(stem);
     if start == end {
@@ -44,9 +62,16 @@ pub fn format_timestamp(now: DateTime<Local>) -> String {
 }
 
 fn sanitize_source_stem(stem: &str) -> String {
+    sanitize_stem(stem, "Document", true)
+}
+
+fn sanitize_stem(stem: &str, fallback: &str, strip_pdf_suffix: bool) -> String {
     let mut value = stem.trim();
 
-    while value.len() >= 4 && value.as_bytes()[value.len() - 4..].eq_ignore_ascii_case(b".pdf") {
+    while strip_pdf_suffix
+        && value.len() >= 4
+        && value.as_bytes()[value.len() - 4..].eq_ignore_ascii_case(b".pdf")
+    {
         value = &value[..value.len() - 4];
         value = value.trim();
     }
@@ -81,7 +106,8 @@ fn sanitize_source_stem(stem: &str) -> String {
         character.is_whitespace() || character == '.' || character == '-'
     });
 
-    while cleaned.len() >= 4
+    while strip_pdf_suffix
+        && cleaned.len() >= 4
         && cleaned.as_bytes()[cleaned.len() - 4..].eq_ignore_ascii_case(b".pdf")
     {
         cleaned = &cleaned[..cleaned.len() - 4];
@@ -91,7 +117,7 @@ fn sanitize_source_stem(stem: &str) -> String {
     }
 
     if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
-        "Document".to_string()
+        fallback.to_string()
     } else {
         cleaned.to_string()
     }
@@ -162,6 +188,33 @@ mod tests {
         assert_eq!(
             default_output_name("pdf.merge", None, now),
             default_output_name("pdf.merge", None, now)
+        );
+    }
+
+    #[test]
+    fn image_output_name_uses_action_source_and_timestamp() {
+        use std::path::Path;
+
+        let now = fixed_time();
+        assert_eq!(
+            image_output_name(Path::new("/tmp/photo.png"), "webp", now),
+            "Quicklet-Convert-photo-20261024-153045.webp"
+        );
+        assert_eq!(
+            image_output_name(Path::new("archive.tar.PNG"), "jpg", now),
+            "Quicklet-Convert-archive.tar-20261024-153045.jpg"
+        );
+        assert_eq!(
+            image_output_name(Path::new("bad:name:2026?.webp"), "png", now),
+            "Quicklet-Convert-bad-name-2026-20261024-153045.png"
+        );
+        assert_eq!(
+            image_output_name(Path::new(".png"), "jpg", now),
+            "Quicklet-Convert-png-20261024-153045.jpg"
+        );
+        assert_eq!(
+            image_output_name(Path::new(""), "jpg", now),
+            "Quicklet-Convert-Image-20261024-153045.jpg"
         );
     }
 
